@@ -9,5 +9,11 @@
 	},
 	"observability": {
 		"enabled": true
+	},
+	"vars": {
+		"STREAM_PLAYBACK_URL": "",
+		"RTMP_PLAYBACK_URL": ""
 	}
+	// TODO: Add container binding for production deployment.
+	// See README.md for details.
 }

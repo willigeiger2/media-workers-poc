@@ -2,14 +2,13 @@
 import Layout from "../layouts/Layout.astro";
 ---
 
-<Layout title="Media Workers PoC — Stream">
+<Layout title="Media Workers PoC — Overlay">
   <main class="container">
-    <h1>WebSocket Video Pass-Through</h1>
+    <h1>WebSocket Video with Overlay</h1>
     <p class="description">
-      Capture webcam video, send it over a WebSocket to a Cloudflare Container
-      running ffmpeg, and output to a Cloudflare Stream Live Input.
-      <br />
-      <a href="/overlay" class="link">Try the Overlay Demo →</a>
+      Capture webcam video and composite a Cloudflare logo overlay using ffmpeg
+      <code>filter_complex</code>. The overlay is rendered server-side in the
+      container before sending to Cloudflare Stream.
     </p>
 
     <div class="video-grid">
@@ -21,6 +20,10 @@ import Layout from "../layouts/Layout.astro";
           <button id="stopBtn" class="btn btn-secondary" disabled>Stop Streaming</button>
         </div>
         <div id="status" class="status">Ready</div>
+        <div class="overlay-preview">
+          <p class="overlay-label">Logo to be overlaid:</p>
+          <img src="/cf-logo.png" alt="Cloudflare logo" class="overlay-logo" />
+        </div>
       </div>
 
       <div class="video-panel">
@@ -68,11 +71,14 @@ import Layout from "../layouts/Layout.astro";
       <h3>How it works</h3>
       <ol>
         <li>Click <strong>Start Streaming</strong> to capture your webcam</li>
-        <li>Video chunks are sent via WebSocket to the Worker</li>
-        <li>Worker proxies chunks to the Go container</li>
-        <li>Container pipes chunks to ffmpeg</li>
-        <li>ffmpeg transcodes to H.264 and sends RTMP to Cloudflare Stream</li>
+        <li>Browser sends a JSON config message to select the <code>overlay</code> preset</li>
+        <li>WebSocket binary chunks go to the Go container</li>
+        <li>Container pipes chunks to ffmpeg with <code>filter_complex</code></li>
+        <li>ffmpeg composites the Cloudflare logo (top-right) and outputs RTMP</li>
       </ol>
+      <p class="back-link">
+        <a href="/">← Back to Pass-Through Streamer</a>
+      </p>
     </div>
   </main>
 </Layout>
@@ -107,8 +113,22 @@ import Layout from "../layouts/Layout.astro";
       ws.binaryType = "arraybuffer";
 
       ws.addEventListener("open", () => {
-        setStatus("Connected. Starting MediaRecorder...", "success");
-        startMediaRecorder();
+        setStatus("Connected. Sending overlay config...", "success");
+
+        // Send overlay preset config as the first text message.
+        const config = {
+          preset: "overlay",
+          overlay_image: "/app/overlays/cf-logo.png",
+          overlay_position: "top-right",
+        };
+        ws.send(JSON.stringify(config));
+
+        // Wait a tick for the text message to be transmitted before
+        // starting MediaRecorder, to avoid a race where the first binary
+        // chunk arrives at the container before the config text message.
+        setTimeout(() => {
+          startMediaRecorder();
+        }, 50);
       });
 
       ws.addEventListener("close", (event) => {
@@ -163,7 +183,7 @@ import Layout from "../layouts/Layout.astro";
 
     // Send chunks every 100ms for low latency.
     mediaRecorder.start(100);
-    setStatus("Streaming live!", "success");
+    setStatus("Streaming with overlay!", "success");
   }
 
   function stopStreaming() {
@@ -381,6 +401,20 @@ import Layout from "../layouts/Layout.astro";
   .info li {
     margin-bottom: 0.5rem;
   }
+
+  .back-link {
+    margin-top: 1.5rem;
+  }
+
+  .back-link a {
+    color: #f48120;
+    text-decoration: none;
+  }
+
+  .back-link a:hover {
+    text-decoration: underline;
+  }
+
   .latency-note {
     margin-top: 0.75rem;
     padding: 0.75rem;
@@ -453,5 +487,27 @@ import Layout from "../layouts/Layout.astro";
 
   .copy-btn.copied {
     background: #2e7d32;
+  }
+
+  .overlay-preview {
+    margin-top: 1rem;
+    padding: 0.75rem;
+    background: 
+      repeating-conic-gradient(#808080 0% 25%, #a0a0a0 0% 50%) 50% / 20px 20px;
+    border-radius: 4px;
+    border: 1px solid #ccc;
+    text-align: center;
+  }
+
+  .overlay-label {
+    margin: 0 0 0.5rem 0;
+    font-size: 0.875rem;
+    color: #fff;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+  }
+
+  .overlay-logo {
+    max-width: 150px;
+    height: auto;
   }
 </style>

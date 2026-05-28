@@ -1,0 +1,111 @@
+---
+import Layout from "../layouts/Layout.astro";
+
+// The Stream Live Input playback URL should be set via environment variable.
+// For local testing, you can hardcode it or pass it via .env
+const streamUrl = import.meta.env.STREAM_PLAYBACK_URL || "";
+// Extract the Live Input ID from the playback URL path
+const liveInputId = streamUrl ? new URL(streamUrl).pathname.split("/").pop() : "";
+---
+
+<Layout title="Media Workers PoC — Watch">
+  <main class="container">
+    <h1>Watch Live Stream</h1>
+    <p class="description">
+      This page embeds the Cloudflare Stream player for the live output.
+    </p>
+
+    {
+      liveInputId ? (
+        <div class="player-wrapper">
+          <iframe
+            src={`https://iframe.cloudflarestream.com/${liveInputId}`}
+            loading="lazy"
+            allow="accelerometer; gyroscope; autoplay; encrypted-media; picture-in-picture;"
+            allowfullscreen="true"
+            class="stream-player"
+          />
+        </div>
+      ) : (
+        <div class="no-stream">
+          <p>
+            No stream playback URL configured. Set <code>STREAM_PLAYBACK_URL</code> in
+            your environment.
+          </p>
+          <p>
+            You can find the playback URL in the Cloudflare Stream dashboard under
+            your Live Input.
+          </p>
+        </div>
+      )
+    }
+
+    <div class="back-link">
+      <a href="/">← Back to Streamer</a>
+    </div>
+  </main>
+</Layout>
+
+<style>
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 2rem;
+  }
+
+  h1 {
+    font-size: 2rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .description {
+    color: #666;
+    margin-bottom: 2rem;
+  }
+
+  .player-wrapper {
+    position: relative;
+    padding-bottom: 56.25%; /* 16:9 */
+    height: 0;
+    overflow: hidden;
+    border-radius: 8px;
+    background: #000;
+  }
+
+  .stream-player {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    border: none;
+  }
+
+  .no-stream {
+    background: #f5f5f5;
+    border-radius: 8px;
+    padding: 2rem;
+    text-align: center;
+    color: #666;
+  }
+
+  code {
+    background: #e0e0e0;
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    font-family: monospace;
+  }
+
+  .back-link {
+    margin-top: 2rem;
+  }
+
+  .back-link a {
+    color: #f48120;
+    text-decoration: none;
+  }
+
+  .back-link a:hover {
+    text-decoration: underline;
+  }
+</style>
