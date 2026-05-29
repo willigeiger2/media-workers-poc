@@ -45,7 +45,12 @@ func (h *StreamHandler) Run() error {
 		return fmt.Errorf("failed to read stream config: %w", err)
 	}
 
-	h.logger.Printf("Config: preset=%q overlay=%q", cfg.Preset, cfg.OverlayImage)
+	// Allow client to override the stream destination.
+	if cfg.StreamURL != "" {
+		streamURL = cfg.StreamURL
+	}
+
+	h.logger.Printf("Config: preset=%q overlay=%q stream=%s", cfg.Preset, cfg.OverlayImage, streamURL)
 
 	// Step 2: Create a pipe for ffmpeg input.
 	pr, pw, err := os.Pipe()

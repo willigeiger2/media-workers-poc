@@ -17,6 +17,15 @@ const { title = "Media Workers PoC" } = Astro.props;
 		<title>{title}</title>
 	</head>
 	<body>
+		<nav class="top-nav">
+			<div class="nav-brand">Media Workers PoC</div>
+			<div class="nav-links">
+				<a href="/">Pass-Through</a>
+				<a href="/overlay">Overlay</a>
+				<a href="/watch">Watch</a>
+				<a href="/settings" class="settings-link">⚙️ Settings</a>
+			</div>
+		</nav>
 		<slot />
 	</body>
 </html>
@@ -26,9 +35,66 @@ const { title = "Media Workers PoC" } = Astro.props;
 	body {
 		margin: 0;
 		width: 100%;
-		height: 100%;
+		min-height: 100%;
 		font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
 			"Helvetica Neue", Arial, sans-serif;
 		line-height: 1.5;
+	}
+
+	.top-nav {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		padding: 0.75rem 1.5rem;
+		background: #1a1a1a;
+		color: white;
+	}
+
+	.nav-brand {
+		font-weight: 600;
+		font-size: 1rem;
+	}
+
+	.nav-links {
+		display: flex;
+		gap: 1.5rem;
+		align-items: center;
+	}
+
+	.nav-links a {
+		color: #ccc;
+		text-decoration: none;
+		font-size: 0.875rem;
+		transition: color 0.2s;
+	}
+
+	.nav-links a:hover {
+		color: #fff;
+	}
+
+	.settings-link {
+		background: #f48120;
+		color: white !important;
+		padding: 0.35rem 0.75rem;
+		border-radius: 4px;
+		font-weight: 500;
+	}
+
+	.settings-link:hover {
+		background: #e07010;
+	}
+
+	@media (max-width: 600px) {
+		.top-nav {
+			flex-direction: column;
+			gap: 0.5rem;
+			padding: 0.75rem;
+		}
+
+		.nav-links {
+			gap: 1rem;
+			flex-wrap: wrap;
+			justify-content: center;
+		}
 	}
 </style>

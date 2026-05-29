@@ -21,6 +21,10 @@ type Config struct {
 	// "passthrough".
 	Preset string `json:"preset"`
 
+	// StreamURL overrides the RTMP destination. If empty, uses the
+	// STREAM_URL environment variable.
+	StreamURL string `json:"stream_url"`
+
 	// OverlayImage is the path to a static image (e.g. PNG with alpha) used
 	// by the "overlay" preset.
 	OverlayImage string `json:"overlay_image"`
@@ -30,14 +34,14 @@ type Config struct {
 	OverlayPosition string `json:"overlay_position"`
 
 	// FFmpegArgs is an escape hatch: if provided, these raw args are used
-	// verbatim instead of any preset. Insecure for production, useful for PoC
-	// experimentation.
+	// verbatim instead of any preset. Only available when built with the
+	// "allow_raw_ffmpeg_args" build tag. Insecure for production.
 	FFmpegArgs []string `json:"ffmpeg_args"`
 }
 
 // BuildArgs returns the full ffmpeg argument list for the given Config.
 func BuildArgs(cfg Config, videoInput string, output string) []string {
-	if len(cfg.FFmpegArgs) > 0 {
+	if rawArgsEnabled() && len(cfg.FFmpegArgs) > 0 {
 		return cfg.FFmpegArgs
 	}
 

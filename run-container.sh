@@ -4,7 +4,8 @@ set -e
 # Build and run the container locally (alternative to docker-compose)
 
 echo "Building container..."
-docker build -t media-workers-poc ./container
+# Build from repo root so Dockerfile can access cf-logo.png
+docker build -t media-workers-poc -f container/Dockerfile .
 
 echo ""
 echo "Starting container on port 8788..."
@@ -13,7 +14,9 @@ echo ""
 
 # Load STREAM_URL from .env if it exists
 if [ -f .env ]; then
-  export $(grep -v '^#' .env | xargs)
+  set -a
+  source .env
+  set +a
 fi
 
 docker run --rm \

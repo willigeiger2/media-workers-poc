@@ -1,0 +1,539 @@
+---
+interface Props {
+  title: string;
+  description: string;
+  preset?: string;
+  showOverlayPreview?: boolean;
+  howItWorksSteps: string[];
+}
+
+const { 
+  title, 
+  description, 
+  preset = "passthrough",
+  showOverlayPreview = false,
+  howItWorksSteps
+} = Astro.props;
+
+// Read env vars at build time for defaults
+const streamPlaybackUrl = import.meta.env.STREAM_PLAYBACK_URL || "";
+const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
+---
+
+<main class="container">
+  <h1>{title}</h1>
+  <p class="description">
+    {description}
+    <br />
+    <slot name="extra-links" />
+  </p>
+
+  <div class="video-grid">
+    <div class="video-panel">
+      <h2>Local Preview</h2>
+      <video id="localVideo" autoplay playsinline muted></video>
+      <div class="controls">
+        <button id="startBtn" class="btn btn-primary">Start Streaming</button>
+        <button id="stopBtn" class="btn btn-secondary" disabled>Stop Streaming</button>
+      </div>
+      <div id="status" class="status">Ready</div>
+      
+      {showOverlayPreview && (
+        <div class="overlay-preview">
+          <p class="overlay-label">Logo to be overlaid:</p>
+          <img src="/cf-logo.png" alt="Cloudflare logo" class="overlay-logo" />
+        </div>
+      )}
+    </div>
+
+    <div class="video-panel">
+      <h2>Stream Output</h2>
+      {
+        streamPlaybackUrl ? (
+          <div class="player-wrapper">
+            <iframe
+              src={`https://iframe.cloudflarestream.com/${new URL(streamPlaybackUrl).pathname.split("/").pop()}`}
+              loading="lazy"
+              allow="accelerometer; gyroscope; autoplay; encrypted-media; picture-in-picture;"
+              allowfullscreen="true"
+              class="stream-player"
+            />
+          </div>
+        ) : (
+          <div id="playerContainer" class="player-placeholder">
+            <p>Stream will appear here when live.</p>
+            <p class="hint">
+              Set <strong>Stream Playback URL</strong> in 
+              <a href="/settings">Settings</a> to see the preview.
+            </p>
+            <a href="/watch" target="_blank" class="link">Open Watch Page →</a>
+          </div>
+        )
+      }
+      <div class="latency-note">
+        <p><strong>Note:</strong> RTMP ingest has ~2s network latency. The Cloudflare Stream output above shows 10-15s latency due to transcoding and HLS packaging.</p>
+        {
+          rtmpPlaybackUrl ? (
+            <div class="ffplay-command">
+              <p>Run this command to see the raw feed (~2s delay):</p>
+              <div class="command-box">
+                <code id="ffplayCmd">ffplay -fflags nobuffer -i "{rtmpPlaybackUrl}"</code>
+                <button id="copyBtn" class="copy-btn" title="Copy to clipboard">📋 Copy</button>
+              </div>
+            </div>
+          ) : (
+            <p>Set <strong>RTMP Playback URL</strong> in <a href="/settings">Settings</a> to see the ffplay command here.</p>
+          )
+        }
+      </div>
+    </div>
+  </div>
+
+  <div class="info">
+    <h3>How it works</h3>
+    <ol>
+      {howItWorksSteps.map(step => (
+        <li set:html={step} />
+      ))}
+    </ol>
+    <slot name="back-link" />
+  </div>
+</main>
+
+<script define:vars={{ preset }}>
+  const localVideo = document.getElementById("localVideo");
+  const startBtn = document.getElementById("startBtn");
+  const stopBtn = document.getElementById("stopBtn");
+  const status = document.getElementById("status");
+
+  let mediaRecorder = null;
+  let ws = null;
+  let stream = null;
+
+  function setStatus(message, type = "info") {
+    status.textContent = message;
+    status.className = `status status-${type}`;
+  }
+
+  function getSettings() {
+    try {
+      return JSON.parse(localStorage.getItem("mediaWorkersSettings") || "{}");
+    } catch {
+      return {};
+    }
+  }
+
+  async function startStreaming() {
+    try {
+      setStatus("Requesting camera access...");
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 1280, height: 720, frameRate: 30 },
+        audio: false,
+      });
+      localVideo.srcObject = stream;
+
+      setStatus("Connecting to server...");
+      const wsUrl = `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/api/stream`;
+      ws = new WebSocket(wsUrl);
+      ws.binaryType = "arraybuffer";
+
+      ws.addEventListener("open", () => {
+        setStatus("Connected. Sending config...", "success");
+
+        const settings = getSettings();
+        const config = {
+          preset: preset,
+        };
+        
+        if (settings.streamUrl) {
+          config.stream_url = settings.streamUrl;
+        }
+        
+        if (preset === "overlay") {
+          config.overlay_image = "/app/overlays/cf-logo.png";
+          config.overlay_position = "top-right";
+        }
+        
+        ws.send(JSON.stringify(config));
+
+        // Wait a tick for the text message to be transmitted before
+        // starting MediaRecorder, to avoid a race where the first binary
+        // chunk arrives at the container before the config text message.
+        setTimeout(() => {
+          startMediaRecorder();
+        }, 50);
+      });
+
+      ws.addEventListener("close", (event) => {
+        setStatus(`Connection closed (${event.code})`);
+        cleanup();
+      });
+
+      ws.addEventListener("error", (error) => {
+        setStatus("WebSocket error", "error");
+        console.error("WebSocket error:", error);
+        cleanup();
+      });
+
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+    } catch (err) {
+      setStatus(`Error: ${err instanceof Error ? err.message : String(err)}`, "error");
+      console.error("Start streaming error:", err);
+      cleanup();
+    }
+  }
+
+  function startMediaRecorder() {
+    if (!stream || !ws) return;
+
+    const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp8")
+      ? "video/webm;codecs=vp8"
+      : "video/webm";
+
+    mediaRecorder = new MediaRecorder(stream, {
+      mimeType,
+      videoBitsPerSecond: 2_000_000,
+    });
+
+    mediaRecorder.addEventListener("dataavailable", (event) => {
+      if (event.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
+        event.data.arrayBuffer().then((buffer) => {
+          ws.send(buffer);
+        });
+      }
+    });
+
+    mediaRecorder.addEventListener("stop", () => {
+      setStatus("Recording stopped");
+    });
+
+    mediaRecorder.addEventListener("error", (event) => {
+      setStatus("MediaRecorder error", "error");
+      console.error("MediaRecorder error:", event);
+    });
+
+    mediaRecorder.start(100);
+    setStatus(preset === "overlay" ? "Streaming with overlay!" : "Streaming live!", "success");
+  }
+
+  function stopStreaming() {
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
+      mediaRecorder.stop();
+    }
+    if (ws) {
+      ws.close(1000, "User stopped streaming");
+    }
+    cleanup();
+    setStatus("Stopped");
+  }
+
+  function cleanup() {
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+      stream = null;
+    }
+    if (localVideo.srcObject) {
+      localVideo.srcObject = null;
+    }
+    mediaRecorder = null;
+    ws = null;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+  }
+
+  startBtn.addEventListener("click", startStreaming);
+  stopBtn.addEventListener("click", stopStreaming);
+
+  // Copy button for ffplay command
+  const copyBtn = document.getElementById("copyBtn");
+  const ffplayCmd = document.getElementById("ffplayCmd");
+  if (copyBtn && ffplayCmd) {
+    copyBtn.addEventListener("click", () => {
+      const text = ffplayCmd.textContent || "";
+      navigator.clipboard.writeText(text).then(() => {
+        copyBtn.textContent = "✓ Copied!";
+        copyBtn.classList.add("copied");
+        setTimeout(() => {
+          copyBtn.textContent = "📋 Copy";
+          copyBtn.classList.remove("copied");
+        }, 2000);
+      }).catch((err) => {
+        console.error("Failed to copy:", err);
+        copyBtn.textContent = "❌ Failed";
+        setTimeout(() => {
+          copyBtn.textContent = "📋 Copy";
+        }, 2000);
+      });
+    });
+  }
+</script>
+
+<style>
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 2rem;
+  }
+
+  h1 {
+    font-size: 2rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .description {
+    color: #666;
+    margin-bottom: 2rem;
+  }
+
+  .video-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2rem;
+    margin-bottom: 2rem;
+  }
+
+  @media (max-width: 768px) {
+    .video-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .video-panel {
+    background: #f5f5f5;
+    border-radius: 8px;
+    padding: 1rem;
+  }
+
+  .video-panel h2 {
+    margin-top: 0;
+    font-size: 1.25rem;
+  }
+
+  video {
+    width: 100%;
+    height: auto;
+    background: #000;
+    border-radius: 4px;
+    aspect-ratio: 16 / 9;
+  }
+
+  .player-placeholder {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #000;
+    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: #999;
+  }
+
+  .player-wrapper {
+    position: relative;
+    padding-bottom: 56.25%; /* 16:9 */
+    height: 0;
+    overflow: hidden;
+    border-radius: 4px;
+    background: #000;
+  }
+
+  .stream-player {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    border: none;
+  }
+
+  .controls {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 1rem;
+  }
+
+  .btn {
+    padding: 0.75rem 1.5rem;
+    border: none;
+    border-radius: 4px;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: opacity 0.2s;
+  }
+
+  .btn:hover:not(:disabled) {
+    opacity: 0.9;
+  }
+
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .btn-primary {
+    background: #f48120;
+    color: white;
+  }
+
+  .btn-secondary {
+    background: #666;
+    color: white;
+  }
+
+  .status {
+    margin-top: 0.75rem;
+    padding: 0.5rem;
+    border-radius: 4px;
+    font-size: 0.875rem;
+    font-family: monospace;
+  }
+
+  .status-info {
+    background: #e3f2fd;
+    color: #1565c0;
+  }
+
+  .status-success {
+    background: #e8f5e9;
+    color: #2e7d32;
+  }
+
+  .status-error {
+    background: #ffebee;
+    color: #c62828;
+  }
+
+  .link {
+    color: #f48120;
+    text-decoration: none;
+    margin-top: 0.5rem;
+  }
+
+  .link:hover {
+    text-decoration: underline;
+  }
+
+  .info {
+    background: #fafafa;
+    border-radius: 8px;
+    padding: 1.5rem;
+  }
+
+  .info h3 {
+    margin-top: 0;
+  }
+
+  .info ol {
+    padding-left: 1.5rem;
+  }
+
+  .info li {
+    margin-bottom: 0.5rem;
+  }
+
+  .latency-note {
+    margin-top: 0.75rem;
+    padding: 0.75rem;
+    background: #fff3e0;
+    border-radius: 4px;
+    font-size: 0.875rem;
+    color: #e65100;
+  }
+
+  .latency-note p {
+    margin: 0 0 0.5rem 0;
+  }
+
+  .latency-note a {
+    color: #f48120;
+  }
+
+  .ffplay-command {
+    margin-top: 0.5rem;
+  }
+
+  .command-box {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: #1e1e1e;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin-top: 0.5rem;
+  }
+
+  .command-box code {
+    flex: 1;
+    color: #7ee787;
+    font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
+    font-size: 0.8125rem;
+    word-break: break-all;
+    background: transparent;
+    padding: 0;
+  }
+
+  .copy-btn {
+    background: #f48120;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.8125rem;
+    cursor: pointer;
+    transition: all 0.2s;
+    white-space: nowrap;
+  }
+
+  .copy-btn:hover {
+    background: #e07010;
+  }
+
+  .copy-btn.copied {
+    background: #2e7d32;
+  }
+
+  .overlay-preview {
+    margin-top: 1rem;
+    padding: 0.75rem;
+    background: repeating-conic-gradient(#808080 0% 25%, #a0a0a0 0% 50%) 50% / 20px 20px;
+    border-radius: 4px;
+    border: 1px solid #ccc;
+    text-align: center;
+  }
+
+  .overlay-label {
+    margin: 0 0 0.5rem 0;
+    font-size: 0.875rem;
+    color: #fff;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+  }
+
+  .overlay-logo {
+    max-width: 150px;
+    height: auto;
+  }
+
+  .hint {
+    font-size: 0.875rem;
+    margin: 0.5rem 0;
+  }
+
+  .hint a {
+    color: #f48120;
+  }
+
+  .back-link {
+    margin-top: 1.5rem;
+  }
+
+  .back-link a {
+    color: #f48120;
+    text-decoration: none;
+  }
+
+  .back-link a:hover {
+    text-decoration: underline;
+  }
+</style>

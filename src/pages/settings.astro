@@ -1,0 +1,303 @@
+---
+import Layout from "../layouts/Layout.astro";
+
+// Read build-time env vars for defaults
+const defaultStreamUrl = import.meta.env.STREAM_URL || "";
+const defaultPlaybackUrl = import.meta.env.STREAM_PLAYBACK_URL || "";
+const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
+---
+
+<Layout title="Media Workers PoC — Settings">
+  <main class="container">
+    <h1>Settings</h1>
+    <p class="description">
+      Configure your Cloudflare Stream connections. These settings are stored
+      locally in your browser and sent to the processing container when you start
+      streaming.
+    </p>
+
+    <div class="settings-form">
+      <div class="field">
+        <label for="streamUrl">Stream Ingest URL (RTMP)</label>
+        <input
+          type="text"
+          id="streamUrl"
+          placeholder="rtmps://live.cloudflare.com:443/live/YOUR_STREAM_KEY"
+        />
+        <p class="hint">
+          From Cloudflare Stream dashboard → Live Inputs → Connection Info.
+          This is the URL + Key combined.
+        </p>
+      </div>
+
+      <div class="field">
+        <label for="playbackUrl">Stream Playback URL</label>
+        <input
+          type="text"
+          id="playbackUrl"
+          placeholder="https://iframe.cloudflarestream.com/YOUR_LIVE_INPUT_ID"
+        />
+        <p class="hint">
+          Web playback URL for the iframe embed. Use the iframe embed URL or
+          HLS manifest from the Stream dashboard.
+        </p>
+      </div>
+
+      <div class="field">
+        <label for="rtmpPlaybackUrl">RTMP Playback URL</label>
+        <input
+          type="text"
+          id="rtmpPlaybackUrl"
+          placeholder="rtmps://live.cloudflare.com:443/live/YOUR_PLAYBACK_KEY"
+        />
+        <p class="hint">
+          The "RTMPS Playback Key" from the Stream dashboard. Used for the
+          low-latency ffplay preview.
+        </p>
+      </div>
+
+      <div class="actions">
+        <button id="saveBtn" class="btn btn-primary">Save Settings</button>
+        <button id="resetBtn" class="btn btn-secondary">Reset to Defaults</button>
+      </div>
+
+      <div id="status" class="status"></div>
+    </div>
+
+    <div class="info">
+      <h3>How settings work</h3>
+      <ul>
+        <li>Settings are saved to your browser's local storage</li>
+        <li>They persist across page refreshes and browser sessions</li>
+        <li>The Stream Ingest URL is sent to the container when you start streaming</li>
+        <li>Playback URLs are used to show the stream preview in the browser</li>
+        <li>If a setting is empty, the page shows a prompt instead of a broken player</li>
+      </ul>
+    </div>
+
+    <p class="back-link">
+      <a href="/">← Back to Pass-Through Streamer</a> |
+      <a href="/overlay">Overlay Demo →</a>
+    </p>
+  </main>
+</Layout>
+
+<script define:vars={{ defaultStreamUrl, defaultPlaybackUrl, defaultRtmpPlaybackUrl }}>
+  const streamUrlInput = document.getElementById("streamUrl");
+  const playbackUrlInput = document.getElementById("playbackUrl");
+  const rtmpPlaybackUrlInput = document.getElementById("rtmpPlaybackUrl");
+  const saveBtn = document.getElementById("saveBtn");
+  const resetBtn = document.getElementById("resetBtn");
+  const status = document.getElementById("status");
+
+  // Default values from build-time env vars (injected by Astro)
+  const defaults = {
+    streamUrl: defaultStreamUrl,
+    playbackUrl: defaultPlaybackUrl,
+    rtmpPlaybackUrl: defaultRtmpPlaybackUrl
+  };
+
+  function loadSettings() {
+    try {
+      const saved = localStorage.getItem("mediaWorkersSettings");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        streamUrlInput.value = parsed.streamUrl || defaults.streamUrl;
+        playbackUrlInput.value = parsed.playbackUrl || defaults.playbackUrl;
+        rtmpPlaybackUrlInput.value = parsed.rtmpPlaybackUrl || defaults.rtmpPlaybackUrl;
+      } else {
+        // No saved settings — populate with defaults from .env
+        streamUrlInput.value = defaults.streamUrl;
+        playbackUrlInput.value = defaults.playbackUrl;
+        rtmpPlaybackUrlInput.value = defaults.rtmpPlaybackUrl;
+      }
+    } catch (e) {
+      console.error("Failed to load settings:", e);
+      // Fall back to defaults on error
+      streamUrlInput.value = defaults.streamUrl;
+      playbackUrlInput.value = defaults.playbackUrl;
+      rtmpPlaybackUrlInput.value = defaults.rtmpPlaybackUrl;
+    }
+  }
+
+  function saveSettings() {
+    const settings = {
+      streamUrl: streamUrlInput.value.trim(),
+      playbackUrl: playbackUrlInput.value.trim(),
+      rtmpPlaybackUrl: rtmpPlaybackUrlInput.value.trim()
+    };
+
+    localStorage.setItem("mediaWorkersSettings", JSON.stringify(settings));
+    showStatus("Settings saved!", "success");
+  }
+
+  function resetSettings() {
+    streamUrlInput.value = defaults.streamUrl;
+    playbackUrlInput.value = defaults.playbackUrl;
+    rtmpPlaybackUrlInput.value = defaults.rtmpPlaybackUrl;
+    
+    localStorage.removeItem("mediaWorkersSettings");
+    showStatus("Settings reset to defaults.", "info");
+  }
+
+  function showStatus(message, type = "info") {
+    status.textContent = message;
+    status.className = `status status-${type}`;
+    
+    setTimeout(() => {
+      status.textContent = "";
+      status.className = "status";
+    }, 3000);
+  }
+
+  // Load saved settings on page load
+  loadSettings();
+
+  saveBtn.addEventListener("click", saveSettings);
+  resetBtn.addEventListener("click", resetSettings);
+</script>
+
+<style>
+  .container {
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 2rem;
+  }
+
+  h1 {
+    font-size: 2rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .description {
+    color: #666;
+    margin-bottom: 2rem;
+  }
+
+  .settings-form {
+    background: #f5f5f5;
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin-bottom: 2rem;
+  }
+
+  .field {
+    margin-bottom: 1.5rem;
+  }
+
+  .field:last-child {
+    margin-bottom: 0;
+  }
+
+  label {
+    display: block;
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+    color: #333;
+  }
+
+  input[type="text"] {
+    width: 100%;
+    padding: 0.75rem;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 1rem;
+    font-family: monospace;
+    box-sizing: border-box;
+  }
+
+  input[type="text"]:focus {
+    outline: none;
+    border-color: #f48120;
+  }
+
+  .hint {
+    margin: 0.5rem 0 0 0;
+    font-size: 0.875rem;
+    color: #666;
+  }
+
+  .actions {
+    display: flex;
+    gap: 0.75rem;
+    margin-top: 1.5rem;
+  }
+
+  .btn {
+    padding: 0.75rem 1.5rem;
+    border: none;
+    border-radius: 4px;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: opacity 0.2s;
+  }
+
+  .btn:hover {
+    opacity: 0.9;
+  }
+
+  .btn-primary {
+    background: #f48120;
+    color: white;
+  }
+
+  .btn-secondary {
+    background: #666;
+    color: white;
+  }
+
+  .status {
+    margin-top: 1rem;
+    padding: 0.75rem;
+    border-radius: 4px;
+    font-size: 0.875rem;
+    min-height: 1.5rem;
+  }
+
+  .status-success {
+    background: #e8f5e9;
+    color: #2e7d32;
+  }
+
+  .status-error {
+    background: #ffebee;
+    color: #c62828;
+  }
+
+  .status-info {
+    background: #e3f2fd;
+    color: #1565c0;
+  }
+
+  .info {
+    background: #fafafa;
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin-bottom: 2rem;
+  }
+
+  .info h3 {
+    margin-top: 0;
+  }
+
+  .info ul {
+    padding-left: 1.5rem;
+  }
+
+  .info li {
+    margin-bottom: 0.5rem;
+  }
+
+  .back-link {
+    margin-top: 2rem;
+  }
+
+  .back-link a {
+    color: #f48120;
+    text-decoration: none;
+  }
+
+  .back-link a:hover {
+    text-decoration: underline;
+  }
+</style>

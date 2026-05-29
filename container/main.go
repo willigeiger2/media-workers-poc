@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 
 	"github.com/gorilla/websocket"
 )
@@ -29,11 +31,42 @@ type Server struct {
 
 // NewServer constructs a Server with all routes registered.
 func NewServer() *Server {
+	allowedOrigins := getAllowedOrigins()
+
 	return &Server{
 		upgrader: websocket.Upgrader{
-			// Allow all origins for this PoC.
-			CheckOrigin: func(r *http.Request) bool { return true },
+			CheckOrigin: func(r *http.Request) bool {
+				origin := r.Header.Get("Origin")
+				// Allow empty origin (non-browser clients)
+				if origin == "" {
+					return true
+				}
+				// Check against allowlist
+				for _, allowed := range allowedOrigins {
+					if strings.HasPrefix(origin, allowed) {
+						return true
+					}
+				}
+				log.Printf("[server] Rejected WebSocket from origin: %s", origin)
+				return false
+			},
 		},
+	}
+}
+
+// getAllowedOrigins returns the list of allowed WebSocket origins.
+// Defaults to localhost for development. Set ALLOWED_ORIGINS env var
+// for production (comma-separated list).
+func getAllowedOrigins() []string {
+	if env := os.Getenv("ALLOWED_ORIGINS"); env != "" {
+		return strings.Split(env, ",")
+	}
+	// Default: allow localhost on any port for development
+	return []string{
+		"http://localhost:",
+		"https://localhost:",
+		"http://127.0.0.1:",
+		"https://127.0.0.1:",
 	}
 }
 
