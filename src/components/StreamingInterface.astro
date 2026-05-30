@@ -47,34 +47,36 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     </div>
 
     <div class="video-panel">
-      <h2>Stream Output</h2>
-      {
-        streamPlaybackUrl ? (
-          <div class="player-wrapper">
+      <h2 id="outputTitle">Stream Output</h2>
+      <div id="streamOutputWrapper" class="player-wrapper">
+        {
+          streamPlaybackUrl ? (
             <iframe
+              id="streamPlayer"
               src={`https://iframe.cloudflarestream.com/${new URL(streamPlaybackUrl).pathname.split("/").pop()}`}
               loading="lazy"
               allow="accelerometer; gyroscope; autoplay; encrypted-media; picture-in-picture;"
               allowfullscreen="true"
               class="stream-player"
             />
-          </div>
-        ) : (
-          <div id="playerContainer" class="player-placeholder">
-            <p>Stream will appear here when live.</p>
-            <p class="hint">
-              Set <strong>Stream Playback URL</strong> in 
-              <a href="/settings">Settings</a> to see the preview.
-            </p>
-            <a href="/watch" target="_blank" class="link">Open Watch Page →</a>
-          </div>
-        )
-      }
-      <div class="latency-note">
-        <p><strong>Note:</strong> RTMP ingest has ~2s network latency. The Cloudflare Stream output above shows 10-15s latency due to transcoding and HLS packaging.</p>
+          ) : (
+            <div id="playerContainer" class="player-placeholder">
+              <p>Stream will appear here when live.</p>
+              <p class="hint">
+                Set <strong>Stream Playback URL</strong> in 
+                <a href="/settings">Settings</a> to see the preview.
+              </p>
+              <a href="/watch" target="_blank" class="link">Open Watch Page →</a>
+            </div>
+          )
+        }
+      </div>
+      <video id="previewVideo" autoplay playsinline muted class="preview-video" style="display: none;"></video>
+      <div id="latencyNote" class="latency-note">
+        <p id="latencyText"><strong>Note:</strong> RTMP ingest has ~2s network latency. The Cloudflare Stream output above shows 10-15s latency due to transcoding and HLS packaging.</p>
         {
           rtmpPlaybackUrl ? (
-            <div class="ffplay-command">
+            <div class="ffplay-command" id="ffplaySection">
               <p>Run this command to see the raw feed (~2s delay):</p>
               <div class="command-box">
                 <code id="ffplayCmd">ffplay -fflags nobuffer -i "{rtmpPlaybackUrl}"</code>
@@ -82,7 +84,7 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
               </div>
             </div>
           ) : (
-            <p>Set <strong>RTMP Playback URL</strong> in <a href="/settings">Settings</a> to see the ffplay command here.</p>
+            <p id="ffplayHint">Set <strong>RTMP Playback URL</strong> in <a href="/settings">Settings</a> to see the ffplay command here.</p>
           )
         }
       </div>
@@ -102,6 +104,12 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
 
 <script define:vars={{ preset }}>
   const localVideo = document.getElementById("localVideo");
+  const previewVideo = document.getElementById("previewVideo");
+  const streamOutputWrapper = document.getElementById("streamOutputWrapper");
+  const outputTitle = document.getElementById("outputTitle");
+  const latencyText = document.getElementById("latencyText");
+  const ffplaySection = document.getElementById("ffplaySection");
+  const ffplayHint = document.getElementById("ffplayHint");
   const startBtn = document.getElementById("startBtn");
   const stopBtn = document.getElementById("stopBtn");
   const status = document.getElementById("status");
@@ -109,6 +117,11 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
   let mediaRecorder = null;
   let ws = null;
   let stream = null;
+  let mediaSource = null;
+  let sourceBuffer = null;
+  let bufferQueue = [];
+  let isSourceBufferReady = false;
+  let driftInterval = null;
 
   function setStatus(message, type = "info") {
     status.textContent = message;
@@ -123,8 +136,131 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     }
   }
 
+  function isPreviewMode() {
+    return !!getSettings().previewMode;
+  }
+
+  function initMSE() {
+    if (!window.MediaSource) {
+      setStatus("MediaSource Extensions not supported in this browser", "error");
+      return false;
+    }
+
+    bufferQueue = [];
+    isSourceBufferReady = false;
+    mediaSource = new MediaSource();
+    previewVideo.src = URL.createObjectURL(mediaSource);
+
+    mediaSource.addEventListener("sourceopen", () => {
+      try {
+        // High profile, level 3.1 — matches ffmpeg libx264 default profile
+        sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.64001F"');
+        sourceBuffer.addEventListener("updateend", processBufferQueue);
+        isSourceBufferReady = true;
+        processBufferQueue();
+
+        // Start drift management: keep playhead near live edge and prune
+        // old buffer so it doesn't grow unbounded.
+        driftInterval = setInterval(() => {
+          if (!previewVideo || !sourceBuffer) return;
+
+          const buffered = previewVideo.buffered;
+          if (buffered.length === 0) return;
+
+          const liveEdge = buffered.end(buffered.length - 1);
+          const current = previewVideo.currentTime;
+          const drift = liveEdge - current;
+
+          // If playhead has drifted more than 1.5s behind live edge,
+          // seek forward to near the live edge.
+          if (drift > 1.5) {
+            const target = Math.max(0, liveEdge - 0.3);
+            previewVideo.currentTime = target;
+          }
+
+          // Prune buffer older than 2s behind current playhead to prevent
+          // unbounded memory growth.
+          const pruneEnd = current - 2;
+          if (pruneEnd > 0 && !sourceBuffer.updating) {
+            try {
+              sourceBuffer.remove(0, pruneEnd);
+            } catch (e) {
+              // ignore
+            }
+          }
+        }, 500);
+      } catch (e) {
+        console.error("MSE sourceopen error:", e);
+        setStatus("MSE initialization failed", "error");
+      }
+    });
+
+    mediaSource.addEventListener("error", (e) => {
+      console.error("MSE error:", e);
+    });
+
+    return true;
+  }
+
+  function appendToBuffer(data) {
+    if (!isSourceBufferReady) {
+      bufferQueue.push(data);
+      return;
+    }
+    bufferQueue.push(data);
+    processBufferQueue();
+  }
+
+  function processBufferQueue() {
+    if (!sourceBuffer || sourceBuffer.updating || bufferQueue.length === 0) return;
+    try {
+      const chunk = bufferQueue.shift();
+      sourceBuffer.appendBuffer(chunk);
+    } catch (e) {
+      console.error("appendBuffer error:", e);
+    }
+  }
+
+  function cleanupMSE() {
+    if (driftInterval) {
+      clearInterval(driftInterval);
+      driftInterval = null;
+    }
+    if (mediaSource) {
+      if (mediaSource.readyState === "open") {
+        try {
+          mediaSource.endOfStream();
+        } catch (e) {
+          // ignore
+        }
+      }
+      mediaSource = null;
+    }
+    sourceBuffer = null;
+    bufferQueue = [];
+    isSourceBufferReady = false;
+    previewVideo.src = "";
+    previewVideo.style.display = "none";
+    streamOutputWrapper.style.display = "block";
+    outputTitle.textContent = "Stream Output";
+    latencyText.innerHTML = "<strong>Note:</strong> RTMP ingest has ~2s network latency. The Cloudflare Stream output above shows 10-15s latency due to transcoding and HLS packaging.";
+    if (ffplaySection) ffplaySection.style.display = "";
+    if (ffplayHint) ffplayHint.style.display = "";
+  }
+
   async function startStreaming() {
     try {
+      const usePreview = isPreviewMode();
+
+      if (usePreview) {
+        streamOutputWrapper.style.display = "none";
+        previewVideo.style.display = "block";
+        outputTitle.textContent = "Live Preview";
+        latencyText.innerHTML = "<strong>Note:</strong> Low-latency preview via WebSocket (~300-500ms). Processed video is sent directly from the container back to your browser using MediaSource Extensions.";
+        if (ffplaySection) ffplaySection.style.display = "none";
+        if (ffplayHint) ffplayHint.style.display = "none";
+      }
+
       setStatus("Requesting camera access...");
       stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 1280, height: 720, frameRate: 30 },
@@ -143,9 +279,10 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
         const settings = getSettings();
         const config = {
           preset: preset,
+          preview_mode: usePreview,
         };
         
-        if (settings.streamUrl) {
+        if (settings.streamUrl && !usePreview) {
           config.stream_url = settings.streamUrl;
         }
         
@@ -156,12 +293,29 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
         
         ws.send(JSON.stringify(config));
 
+        if (usePreview) {
+          if (!initMSE()) {
+            setStatus("Preview mode not supported in this browser", "error");
+            cleanup();
+            return;
+          }
+        }
+
         // Wait a tick for the text message to be transmitted before
         // starting MediaRecorder, to avoid a race where the first binary
         // chunk arrives at the container before the config text message.
         setTimeout(() => {
-          startMediaRecorder();
+          startMediaRecorder(usePreview);
         }, 50);
+      });
+
+      ws.addEventListener("message", (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          // Binary message from container — this is preview video data
+          if (usePreview) {
+            appendToBuffer(new Uint8Array(event.data));
+          }
+        }
       });
 
       ws.addEventListener("close", (event) => {
@@ -184,7 +338,7 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     }
   }
 
-  function startMediaRecorder() {
+  function startMediaRecorder(usePreview) {
     if (!stream || !ws) return;
 
     const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp8")
@@ -193,7 +347,7 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
 
     mediaRecorder = new MediaRecorder(stream, {
       mimeType,
-      videoBitsPerSecond: 2_000_000,
+      videoBitsPerSecond: usePreview ? 4_000_000 : 2_000_000,
     });
 
     mediaRecorder.addEventListener("dataavailable", (event) => {
@@ -238,6 +392,7 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     }
     mediaRecorder = null;
     ws = null;
+    cleanupMSE();
     startBtn.disabled = false;
     stopBtn.disabled = true;
   }
@@ -267,6 +422,20 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
       });
     });
   }
+
+  // Apply saved preview mode setting immediately on page load.
+  function applyPreviewModeUI() {
+    if (isPreviewMode()) {
+      streamOutputWrapper.style.display = "none";
+      previewVideo.style.display = "block";
+      outputTitle.textContent = "Live Preview";
+      latencyText.innerHTML = "<strong>Note:</strong> Low-latency preview via WebSocket (~300-500ms). Processed video is sent directly from the container back to your browser using MediaSource Extensions.";
+      if (ffplaySection) ffplaySection.style.display = "none";
+      if (ffplayHint) ffplayHint.style.display = "none";
+    }
+  }
+
+  applyPreviewModeUI();
 </script>
 
 <style>
@@ -316,6 +485,14 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     background: #000;
     border-radius: 4px;
     aspect-ratio: 16 / 9;
+  }
+
+  .preview-video {
+    display: none;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #000;
+    border-radius: 4px;
   }
 
   .player-placeholder {

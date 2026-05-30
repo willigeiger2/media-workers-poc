@@ -15,6 +15,7 @@ This project demonstrates a video pass-through pipeline using Cloudflare Workers
 
 - **Pass-through** (`/`): Webcam → WebSocket → ffmpeg → RTMP → Stream
 - **Overlay demo** (`/overlay`): Same pipeline but composites a Cloudflare logo on top of the video using ffmpeg `filter_complex`
+- **Low-latency preview** (Settings): Instead of sending to Stream Live, the container sends the processed video back over the WebSocket. The browser plays it via MediaSource Extensions (MSE) with ~300-500ms latency.
 
 ### Presets (Container-Side)
 
@@ -28,6 +29,10 @@ Supported presets:
 - `passthrough` (default): Just transcode and send to RTMP
 - `overlay`: Composite a static PNG image using ffmpeg `overlay` filter
 - Positions: `top-right`, `top-left`, `bottom-right`, `bottom-left`
+
+Additional config fields:
+- `preview_mode` (bool): When `true`, ffmpeg outputs fragmented MP4 to stdout and the container streams it back over the WebSocket for browser playback.
+- `stream_url` (string): Override the RTMP destination (ignored when `preview_mode` is `true`).
 
 Escape hatch for experimentation:
 ```json
@@ -299,6 +304,18 @@ The Go container runs an HTTP server with a `/ws` endpoint. When a WebSocket con
    - Output FLV format for RTMP
 4. A goroutine reads WebSocket messages and writes them to the pipe
 5. When the WebSocket closes, the pipe is closed, ffmpeg sees EOF, finalizes the output, and exits
+
+### Low-Latency Browser Preview (Preview Mode)
+
+When **Enable low-latency browser preview** is turned on in Settings, the pipeline changes:
+
+1. The browser sends `preview_mode: true` in the JSON config message
+2. ffmpeg outputs **fragmented MP4** (`-f mp4 -movflags frag_keyframe+empty_moov+default_base_moof`) to stdout instead of RTMP
+3. A second goroutine in the container reads ffmpeg stdout and sends binary chunks back over the WebSocket
+4. The browser receives the chunks and plays them via **MediaSource Extensions** in a `<video>` element
+5. Latency is ~300-500ms (just the encoding + network hop)
+
+This mode works with both the `passthrough` and `overlay` presets.
 
 ### Graceful Shutdown
 

@@ -33,6 +33,11 @@ type Config struct {
 	// "top-left", "bottom-right", "bottom-left".
 	OverlayPosition string `json:"overlay_position"`
 
+	// PreviewMode sends the transcoded output back over the WebSocket
+	// instead of pushing it to an RTMP destination. This gives a low-latency
+	// browser preview using MediaSource Extensions.
+	PreviewMode bool `json:"preview_mode"`
+
 	// FFmpegArgs is an escape hatch: if provided, these raw args are used
 	// verbatim instead of any preset. Only available when built with the
 	// "allow_raw_ffmpeg_args" build tag. Insecure for production.
@@ -45,6 +50,10 @@ func BuildArgs(cfg Config, videoInput string, output string) []string {
 		return cfg.FFmpegArgs
 	}
 
+	if cfg.PreviewMode {
+		return buildPreviewArgs(cfg, videoInput)
+	}
+
 	switch cfg.Preset {
 	case "overlay":
 		return BuildOverlayArgs(cfg, videoInput, output)
@@ -52,6 +61,75 @@ func BuildArgs(cfg Config, videoInput string, output string) []string {
 		fallthrough
 	default:
 		return BuildPassthroughArgs(videoInput, output)
+	}
+}
+
+// buildPreviewArgs constructs ffmpeg arguments for low-latency browser preview.
+// Output is fragmented MP4 (fMP4) written to stdout so the container can
+// stream it back over the WebSocket. The browser plays it via MSE.
+func buildPreviewArgs(cfg Config, videoInput string) []string {
+	// Base video encoding args shared by all preview presets.
+	// Use CRF instead of fixed bitrate for better quality, since the
+	// output stays on the local WebSocket and bandwidth is not a concern.
+	videoArgs := []string{
+		"-c:v", "libx264",
+		"-preset", "fast",
+		"-crf", "20",
+		"-g", defaultTranscodeGOP,
+		"-pix_fmt", "yuv420p",
+		"-an",
+		"-f", "mp4",
+		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+		"pipe:1",
+	}
+
+	switch cfg.Preset {
+	case "overlay":
+		overlayImage := cfg.OverlayImage
+		if overlayImage == "" {
+			overlayImage = "/app/overlays/cf-logo.png"
+		}
+
+		position := cfg.OverlayPosition
+		if position == "" {
+			position = "top-right"
+		}
+
+		var xExpr, yExpr string
+		switch position {
+		case "top-left":
+			xExpr = "10"
+			yExpr = "10"
+		case "bottom-left":
+			xExpr = "10"
+			yExpr = "H-h-10"
+		case "bottom-right":
+			xExpr = "W-w-10"
+			yExpr = "H-h-10"
+		case "top-right":
+			fallthrough
+		default:
+			xExpr = "W-w-10"
+			yExpr = "10"
+		}
+
+		filterComplex := "[1:v]format=rgba,scale=600:-1[logo];[0:v][logo]overlay=" + xExpr + ":" + yExpr + ":format=auto,format=yuv420p"
+
+		return append([]string{
+			"-y",
+			"-f", "webm",
+			"-i", videoInput,
+			"-i", overlayImage,
+			"-filter_complex", filterComplex,
+		}, videoArgs...)
+	case "passthrough":
+		fallthrough
+	default:
+		return append([]string{
+			"-y",
+			"-f", "webm",
+			"-i", videoInput,
+		}, videoArgs...)
 	}
 }
 

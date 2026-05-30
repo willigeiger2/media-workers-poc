@@ -56,6 +56,19 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
         </p>
       </div>
 
+      <div class="field field-checkbox">
+        <label class="checkbox-label">
+          <input type="checkbox" id="previewMode" />
+          <span class="checkmark"></span>
+          <span class="label-text">Enable low-latency browser preview</span>
+        </label>
+        <p class="hint">
+          When enabled, the processed video is sent back over the WebSocket
+          and played directly in the browser using MediaSource Extensions
+          (~300-500ms latency). Disables RTMP output while streaming.
+        </p>
+      </div>
+
       <div class="actions">
         <button id="saveBtn" class="btn btn-primary">Save Settings</button>
         <button id="resetBtn" class="btn btn-secondary">Reset to Defaults</button>
@@ -86,6 +99,7 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
   const streamUrlInput = document.getElementById("streamUrl");
   const playbackUrlInput = document.getElementById("playbackUrl");
   const rtmpPlaybackUrlInput = document.getElementById("rtmpPlaybackUrl");
+  const previewModeInput = document.getElementById("previewMode");
   const saveBtn = document.getElementById("saveBtn");
   const resetBtn = document.getElementById("resetBtn");
   const status = document.getElementById("status");
@@ -94,7 +108,8 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
   const defaults = {
     streamUrl: defaultStreamUrl,
     playbackUrl: defaultPlaybackUrl,
-    rtmpPlaybackUrl: defaultRtmpPlaybackUrl
+    rtmpPlaybackUrl: defaultRtmpPlaybackUrl,
+    previewMode: false
   };
 
   function loadSettings() {
@@ -105,11 +120,13 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
         streamUrlInput.value = parsed.streamUrl || defaults.streamUrl;
         playbackUrlInput.value = parsed.playbackUrl || defaults.playbackUrl;
         rtmpPlaybackUrlInput.value = parsed.rtmpPlaybackUrl || defaults.rtmpPlaybackUrl;
+        previewModeInput.checked = parsed.previewMode ?? defaults.previewMode;
       } else {
         // No saved settings — populate with defaults from .env
         streamUrlInput.value = defaults.streamUrl;
         playbackUrlInput.value = defaults.playbackUrl;
         rtmpPlaybackUrlInput.value = defaults.rtmpPlaybackUrl;
+        previewModeInput.checked = defaults.previewMode;
       }
     } catch (e) {
       console.error("Failed to load settings:", e);
@@ -117,6 +134,7 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
       streamUrlInput.value = defaults.streamUrl;
       playbackUrlInput.value = defaults.playbackUrl;
       rtmpPlaybackUrlInput.value = defaults.rtmpPlaybackUrl;
+      previewModeInput.checked = defaults.previewMode;
     }
   }
 
@@ -124,7 +142,8 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     const settings = {
       streamUrl: streamUrlInput.value.trim(),
       playbackUrl: playbackUrlInput.value.trim(),
-      rtmpPlaybackUrl: rtmpPlaybackUrlInput.value.trim()
+      rtmpPlaybackUrl: rtmpPlaybackUrlInput.value.trim(),
+      previewMode: previewModeInput.checked
     };
 
     localStorage.setItem("mediaWorkersSettings", JSON.stringify(settings));
@@ -135,6 +154,7 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     streamUrlInput.value = defaults.streamUrl;
     playbackUrlInput.value = defaults.playbackUrl;
     rtmpPlaybackUrlInput.value = defaults.rtmpPlaybackUrl;
+    previewModeInput.checked = defaults.previewMode;
     
     localStorage.removeItem("mediaWorkersSettings");
     showStatus("Settings reset to defaults.", "info");
@@ -187,6 +207,32 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
 
   .field:last-child {
     margin-bottom: 0;
+  }
+
+  .field-checkbox {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    cursor: pointer;
+    font-weight: 600;
+    color: #333;
+  }
+
+  .checkbox-label input[type="checkbox"] {
+    width: 1.25rem;
+    height: 1.25rem;
+    accent-color: #f48120;
+    cursor: pointer;
+  }
+
+  .label-text {
+    font-weight: 600;
   }
 
   label {

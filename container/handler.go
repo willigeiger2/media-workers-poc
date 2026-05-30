@@ -32,9 +32,6 @@ func NewStreamHandler(conn *websocket.Conn) *StreamHandler {
 // WebSocket messages to ffmpeg's stdin pipe.
 func (h *StreamHandler) Run() error {
 	streamURL := os.Getenv("STREAM_URL")
-	if streamURL == "" {
-		return fmt.Errorf("STREAM_URL environment variable not set")
-	}
 
 	// Step 1: Read configuration and first binary chunk.
 	// The client may send an optional JSON text message first to select a
@@ -50,7 +47,12 @@ func (h *StreamHandler) Run() error {
 		streamURL = cfg.StreamURL
 	}
 
-	h.logger.Printf("Config: preset=%q overlay=%q stream=%s", cfg.Preset, cfg.OverlayImage, streamURL)
+	// Validate that we have a destination unless we're in preview mode.
+	if !cfg.PreviewMode && streamURL == "" {
+		return fmt.Errorf("STREAM_URL environment variable not set")
+	}
+
+	h.logger.Printf("Config: preset=%q overlay=%q preview=%v stream=%s", cfg.Preset, cfg.OverlayImage, cfg.PreviewMode, streamURL)
 
 	// Step 2: Create a pipe for ffmpeg input.
 	pr, pw, err := os.Pipe()
@@ -66,8 +68,18 @@ func (h *StreamHandler) Run() error {
 	cmd := exec.Command("ffmpeg", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.ExtraFiles = []*os.File{pr}
-	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+
+	var ffmpegOut io.ReadCloser
+	if cfg.PreviewMode {
+		// In preview mode ffmpeg writes fragmented MP4 to stdout.
+		ffmpegOut, err = cmd.StdoutPipe()
+		if err != nil {
+			return fmt.Errorf("failed to create stdout pipe: %w", err)
+		}
+	} else {
+		cmd.Stdout = os.Stdout
+	}
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start ffmpeg: %w", err)
@@ -87,6 +99,15 @@ func (h *StreamHandler) Run() error {
 	go func() {
 		wsDone <- h.proxyWebSocketToPipe(pw)
 	}()
+
+	// Step 5b: In preview mode, proxy ffmpeg stdout back to the WebSocket.
+	var previewDone chan error
+	if cfg.PreviewMode && ffmpegOut != nil {
+		previewDone = make(chan error, 1)
+		go func() {
+			previewDone <- h.proxyFfmpegOutputToWebSocket(ffmpegOut)
+		}()
+	}
 
 	// Step 6: Wait for ffmpeg exit.
 	ffmpegDone := make(chan error, 1)
@@ -129,6 +150,15 @@ func (h *StreamHandler) Run() error {
 		}
 		h.logger.Printf("ffmpeg exited cleanly (unexpectedly early)")
 		h.conn.Close()
+	}
+
+	// If preview goroutine is still running, give it a moment to finish.
+	if previewDone != nil {
+		select {
+		case <-previewDone:
+		case <-time.After(2 * time.Second):
+			h.logger.Printf("preview proxy did not finish in time")
+		}
 	}
 
 	return nil
@@ -198,4 +228,29 @@ func (h *StreamHandler) proxyWebSocketToPipe(w io.WriteCloser) error {
 			return err
 		}
 	}
+}
+
+// proxyFfmpegOutputToWebSocket reads ffmpeg stdout and sends chunks back
+// over the WebSocket. This enables low-latency browser preview via MSE.
+func (h *StreamHandler) proxyFfmpegOutputToWebSocket(r io.ReadCloser) error {
+	defer r.Close()
+
+	buf := make([]byte, 65536)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if err := h.conn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+				h.logger.Printf("WebSocket write error (preview): %v", err)
+				return err
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				h.logger.Printf("ffmpeg stdout read error: %v", err)
+				return err
+			}
+			break
+		}
+	}
+	return nil
 }
