@@ -8,10 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
-	"time"
 
 	"github.com/gorilla/websocket"
 	"media-workers-poc/ffmpeg"
+	"media-workers-poc/overlay"
 )
 
 // StreamHandler manages a single WebSocket connection and its ffmpeg pipeline.
@@ -34,9 +34,6 @@ func (h *StreamHandler) Run() error {
 	streamURL := os.Getenv("STREAM_URL")
 
 	// Step 1: Read configuration and first binary chunk.
-	// The client may send an optional JSON text message first to select a
-	// preset (e.g. overlay). If no text message is sent, we default to
-	// passthrough.
 	cfg, firstChunk, err := h.readConfigAndFirstChunk()
 	if err != nil {
 		return fmt.Errorf("failed to read stream config: %w", err)
@@ -52,121 +49,175 @@ func (h *StreamHandler) Run() error {
 		return fmt.Errorf("STREAM_URL environment variable not set")
 	}
 
-	h.logger.Printf("Config: preset=%q overlay=%q preview=%v stream=%s", cfg.Preset, cfg.OverlayImage, cfg.PreviewMode, streamURL)
+	isAnimatedOverlay := cfg.Preset == "animated-overlay"
+	isFilters := cfg.Preset == "filters"
 
-	// Step 2: Create a pipe for ffmpeg input.
-	pr, pw, err := os.Pipe()
-	if err != nil {
-		return fmt.Errorf("failed to create pipe: %w", err)
-	}
-	defer pr.Close()
+	h.logger.Printf("Config: preset=%q preview=%v animated=%v filters=%v stream=%s",
+		cfg.Preset, cfg.PreviewMode, isAnimatedOverlay, isFilters, streamURL)
 
-	// Step 3: Build ffmpeg arguments and start ffmpeg.
-	args := ffmpeg.BuildArgs(cfg, "/dev/fd/3", streamURL)
-	h.logger.Printf("Starting ffmpeg: %v", args)
-
-	cmd := exec.Command("ffmpeg", args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.ExtraFiles = []*os.File{pr}
-	cmd.Stderr = os.Stderr
-
-	var ffmpegOut io.ReadCloser
-	if cfg.PreviewMode {
-		// In preview mode ffmpeg writes fragmented MP4 to stdout.
-		ffmpegOut, err = cmd.StdoutPipe()
-		if err != nil {
-			return fmt.Errorf("failed to create stdout pipe: %w", err)
-		}
-	} else {
-		cmd.Stdout = os.Stdout
-	}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start ffmpeg: %w", err)
-	}
-
-	// Close the read end in the parent process — only ffmpeg should read it.
-	pr.Close()
-
-	// Step 4: Write the first chunk to the pipe.
-	if _, err := pw.Write(firstChunk); err != nil {
-		return fmt.Errorf("failed to write first chunk: %w", err)
-	}
-	h.logger.Printf("Wrote first chunk to ffmpeg pipe")
-
-	// Step 5: Continue proxying remaining WebSocket messages to the pipe.
+	// Start a persistent goroutine that reads from the WebSocket and feeds
+	// binary chunks into a buffered channel.
+	chunkQueue := make(chan []byte, 100)
 	wsDone := make(chan error, 1)
 	go func() {
-		wsDone <- h.proxyWebSocketToPipe(pw)
+		wsDone <- h.wsReader(chunkQueue)
 	}()
 
-	// Step 5b: In preview mode, proxy ffmpeg stdout back to the WebSocket.
-	var previewDone chan error
-	if cfg.PreviewMode && ffmpegOut != nil {
-		previewDone = make(chan error, 1)
-		go func() {
-			previewDone <- h.proxyFfmpegOutputToWebSocket(ffmpegOut)
-		}()
-	}
+	// Seed the first chunk into the queue.
+	chunkQueue <- firstChunk
 
-	// Step 6: Wait for ffmpeg exit.
-	ffmpegDone := make(chan error, 1)
-	go func() {
-		ffmpegDone <- cmd.Wait()
-	}()
-
-	// Wait for either side to finish.
-	select {
-	case err := <-wsDone:
-		if err != nil {
-			h.logger.Printf("WebSocket proxy error: %v", err)
+	// Main loop: manages ffmpeg lifecycle. Each iteration starts a new ffmpeg
+	// process. For the filters preset, the browser now does a full reconnect
+	// when filters change, so each connection gets exactly one ffmpeg process.
+	for iteration := 0; ; iteration++ {
+		// Sanity check — we only expect one iteration per connection now.
+		if iteration > 0 {
+			h.logger.Printf("Unexpected iteration %d — client should reconnect for filter changes", iteration)
 		}
-		// WebSocket closed (client disconnected). Close the pipe to signal
-		// EOF to ffmpeg, then wait for it to exit gracefully.
-		h.logger.Printf("WebSocket closed, signaling EOF to ffmpeg")
-		pw.Close()
+
+		// Step 2: Create a pipe for ffmpeg video input.
+		pr, pw, err := os.Pipe()
+		if err != nil {
+			return fmt.Errorf("failed to create pipe: %w", err)
+		}
+
+		// Step 2b: For animated overlay, create a second pipe and start frame generator.
+		var overlayPr, overlayPw *os.File
+		var frameGenDone chan error
+		var genDone chan struct{}
+		if isAnimatedOverlay {
+			overlayPr, overlayPw, err = os.Pipe()
+			if err != nil {
+				pr.Close()
+				pw.Close()
+				return fmt.Errorf("failed to create overlay pipe: %w", err)
+			}
+
+			gen := overlay.NewFrameGenerator()
+			gen.Width = cfg.OverlayWidth
+			if gen.Width == 0 {
+				gen.Width = 1280
+			}
+			gen.Height = cfg.OverlayHeight
+			if gen.Height == 0 {
+				gen.Height = 720
+			}
+			gen.TimezoneOffsetMin = cfg.TimezoneOffsetMin
+			genDone = make(chan struct{})
+			frameGenDone = make(chan error, 1)
+			go func() {
+				frameGenDone <- gen.Run(overlayPw, genDone)
+			}()
+		}
+
+		// Step 3: Build ffmpeg arguments and start ffmpeg.
+		var args []string
+		if isAnimatedOverlay {
+			args = ffmpeg.BuildAnimatedOverlayArgs(cfg, "/dev/fd/3", streamURL)
+		} else {
+			args = ffmpeg.BuildArgs(cfg, "/dev/fd/3", streamURL)
+		}
+		h.logger.Printf("Starting ffmpeg (iteration %d): %v", iteration, args)
+
+		cmd := exec.Command("ffmpeg", args...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if isAnimatedOverlay {
+			cmd.ExtraFiles = []*os.File{pr, overlayPr}
+		} else {
+			cmd.ExtraFiles = []*os.File{pr}
+		}
+		cmd.Stderr = os.Stderr
+
+		var ffmpegOut io.ReadCloser
+		if cfg.PreviewMode {
+			ffmpegOut, err = cmd.StdoutPipe()
+			if err != nil {
+				pr.Close()
+				pw.Close()
+				if overlayPr != nil {
+					overlayPr.Close()
+				}
+				return fmt.Errorf("failed to create stdout pipe: %w", err)
+			}
+		} else {
+			cmd.Stdout = os.Stdout
+		}
+
+		if err := cmd.Start(); err != nil {
+			pr.Close()
+			pw.Close()
+			if overlayPr != nil {
+				overlayPr.Close()
+			}
+			return fmt.Errorf("failed to start ffmpeg: %w", err)
+		}
+
+		// Close read ends in parent — only ffmpeg reads them.
+		pr.Close()
+		if overlayPr != nil {
+			overlayPr.Close()
+		}
+
+		// Step 4: Start a goroutine that drains chunkQueue and writes to the pipe.
+		stopWriter := make(chan struct{})
+		writerDone := make(chan error, 1)
+		go func(w io.WriteCloser) {
+			writerDone <- h.pipeWriter(w, chunkQueue, stopWriter)
+		}(pw)
+
+		// Step 5: In preview mode, proxy ffmpeg stdout back to the WebSocket.
+		var previewDone chan error
+		if cfg.PreviewMode && ffmpegOut != nil {
+			previewDone = make(chan error, 1)
+			go func() {
+				previewDone <- h.proxyFfmpegOutputToWebSocket(ffmpegOut)
+			}()
+		}
+
+		// Step 6: Wait for ffmpeg exit or client disconnect.
+		ffmpegDone := make(chan error, 1)
+		go func() {
+			ffmpegDone <- cmd.Wait()
+		}()
 
 		select {
+		case err := <-writerDone:
+			if err != nil {
+				h.logger.Printf("Pipe writer error: %v", err)
+			}
+			// Pipe closed (client disconnected or error).
+			cmd.Process.Kill()
+			<-ffmpegDone
+			if isAnimatedOverlay && genDone != nil {
+				close(genDone)
+				<-frameGenDone
+			}
+			return nil
+
 		case err := <-ffmpegDone:
+			// ffmpeg exited early (e.g., malformed args) or cleanly.
 			if err != nil {
 				h.logger.Printf("ffmpeg exited with error: %v", err)
+			} else {
+				h.logger.Printf("ffmpeg exited cleanly")
+			}
+			close(stopWriter)
+			<-writerDone
+			if isAnimatedOverlay && genDone != nil {
+				close(genDone)
+				<-frameGenDone
+			}
+			if err != nil {
+				h.conn.Close()
 				return fmt.Errorf("ffmpeg failed: %w", err)
 			}
-			h.logger.Printf("ffmpeg exited cleanly")
-		case <-time.After(ffmpeg.ShutdownTimeout):
-			h.logger.Printf("ffmpeg did not exit within %v, killing", ffmpeg.ShutdownTimeout)
-			cmd.Process.Kill()
-			<-ffmpegDone // reap
-			return fmt.Errorf("ffmpeg shutdown timeout")
-		}
-
-	case err := <-ffmpegDone:
-		// ffmpeg exited early (e.g., RTMP handshake failure).
-		if err != nil {
-			h.logger.Printf("ffmpeg exited early with error: %v", err)
-			// Close the WebSocket so the client knows something went wrong.
-			h.conn.Close()
-			return fmt.Errorf("ffmpeg exited early: %w", err)
-		}
-		h.logger.Printf("ffmpeg exited cleanly (unexpectedly early)")
-		h.conn.Close()
-	}
-
-	// If preview goroutine is still running, give it a moment to finish.
-	if previewDone != nil {
-		select {
-		case <-previewDone:
-		case <-time.After(2 * time.Second):
-			h.logger.Printf("preview proxy did not finish in time")
+			return nil
 		}
 	}
-
-	return nil
 }
 
 // readConfigAndFirstChunk reads messages from the WebSocket until it has
 // both a Config (optional) and the first binary chunk (required).
-// If no text message is received, it defaults to passthrough.
 func (h *StreamHandler) readConfigAndFirstChunk() (ffmpeg.Config, []byte, error) {
 	var cfg ffmpeg.Config
 	var firstChunk []byte
@@ -182,28 +233,22 @@ func (h *StreamHandler) readConfigAndFirstChunk() (ffmpeg.Config, []byte, error)
 				h.logger.Printf("Invalid config JSON, using defaults: %v", err)
 				cfg = ffmpeg.Config{}
 			}
-			continue // Keep reading for the first binary chunk.
+			continue
 		}
 
 		if messageType == websocket.BinaryMessage {
 			firstChunk = data
 			break
 		}
-
-		// Ignore other message types (ping, pong, close).
 	}
 
 	return cfg, firstChunk, nil
 }
 
-// proxyWebSocketToPipe reads binary messages from the WebSocket and writes
-// them to the given pipe. It returns when the WebSocket is closed or an
-// error occurs.
-func (h *StreamHandler) proxyWebSocketToPipe(w io.WriteCloser) error {
-	defer w.Close()
-
-	totalBytes := 0
-
+// wsReader reads messages from the WebSocket forever. Binary chunks are sent
+// to chunkQueue. Text messages are ignored (the initial config is read by
+// readConfigAndFirstChunk before this goroutine starts).
+func (h *StreamHandler) wsReader(chunkQueue chan<- []byte) error {
 	for {
 		messageType, data, err := h.conn.ReadMessage()
 		if err != nil {
@@ -217,15 +262,36 @@ func (h *StreamHandler) proxyWebSocketToPipe(w io.WriteCloser) error {
 		}
 
 		if messageType != websocket.BinaryMessage {
-			// Ignore non-binary messages (e.g., control messages).
 			continue
 		}
 
-		totalBytes += len(data)
+		// Non-blocking send so we don't stall the WebSocket reader if the
+		// queue is momentarily full.
+		select {
+		case chunkQueue <- data:
+		default:
+			h.logger.Printf("Chunk queue full, dropping frame")
+		}
+	}
+}
 
-		if _, err := w.Write(data); err != nil {
-			h.logger.Printf("Pipe write error: %v", err)
-			return err
+// pipeWriter drains chunkQueue and writes to the given pipe. It returns when
+// the stop channel is closed or the pipe is closed.
+func (h *StreamHandler) pipeWriter(w io.WriteCloser, chunkQueue <-chan []byte, stop <-chan struct{}) error {
+	defer w.Close()
+
+	for {
+		select {
+		case <-stop:
+			return nil
+		case chunk, ok := <-chunkQueue:
+			if !ok {
+				return nil
+			}
+			if _, err := w.Write(chunk); err != nil {
+				// Any write error means the pipe is broken (ffmpeg exited).
+				return nil
+			}
 		}
 	}
 }

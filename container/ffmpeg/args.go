@@ -2,7 +2,11 @@
 // pipeline.
 package ffmpeg
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 // ShutdownTimeout is how long we wait for ffmpeg to finalize output after
 // the input pipe is closed.
@@ -38,10 +42,35 @@ type Config struct {
 	// browser preview using MediaSource Extensions.
 	PreviewMode bool `json:"preview_mode"`
 
+	// OverlayWidth and OverlayHeight specify the dimensions of the raw
+	// RGBA overlay stream (animated-overlay preset).
+	OverlayWidth  int `json:"overlay_width"`
+	OverlayHeight int `json:"overlay_height"`
+
+	// TimezoneOffsetMin is the client's timezone offset from UTC in minutes
+	// (e.g., -420 for PDT). Used by the animated-overlay preset to display
+	// local time.
+	TimezoneOffsetMin int `json:"timezone_offset_min"`
+
+	// Filters holds real-time video filter parameters (filters preset).
+	Filters FilterParams `json:"filters"`
+
 	// FFmpegArgs is an escape hatch: if provided, these raw args are used
 	// verbatim instead of any preset. Only available when built with the
 	// "allow_raw_ffmpeg_args" build tag. Insecure for production.
 	FFmpegArgs []string `json:"ffmpeg_args"`
+}
+
+// FilterParams holds the adjustable video filter values.
+type FilterParams struct {
+	Blur       float64 `json:"blur"`       // 0–10
+	Brightness float64 `json:"brightness"` // -1.0 to 1.0
+	Contrast   float64 `json:"contrast"`   // 0.0 to 2.0
+	Saturation float64 `json:"saturation"` // 0.0 to 2.0
+	Gamma      float64 `json:"gamma"`      // 0.1 to 3.0
+	Sharpen    float64 `json:"sharpen"`    // 0–5
+	Flip       bool    `json:"flip"`       // horizontal flip
+	Rotate     int     `json:"rotate"`     // 0, 90, 180, 270
 }
 
 // BuildArgs returns the full ffmpeg argument list for the given Config.
@@ -50,97 +79,29 @@ func BuildArgs(cfg Config, videoInput string, output string) []string {
 		return cfg.FFmpegArgs
 	}
 
-	if cfg.PreviewMode {
-		return buildPreviewArgs(cfg, videoInput)
-	}
-
 	switch cfg.Preset {
+	case "animated-overlay":
+		return BuildAnimatedOverlayArgs(cfg, "/dev/fd/3", output)
+	case "filters":
+		return BuildFilterArgs(cfg, videoInput, output)
 	case "overlay":
 		return BuildOverlayArgs(cfg, videoInput, output)
 	case "passthrough":
 		fallthrough
 	default:
-		return BuildPassthroughArgs(videoInput, output)
-	}
-}
-
-// buildPreviewArgs constructs ffmpeg arguments for low-latency browser preview.
-// Output is fragmented MP4 (fMP4) written to stdout so the container can
-// stream it back over the WebSocket. The browser plays it via MSE.
-func buildPreviewArgs(cfg Config, videoInput string) []string {
-	// Base video encoding args shared by all preview presets.
-	// Use CRF instead of fixed bitrate for better quality, since the
-	// output stays on the local WebSocket and bandwidth is not a concern.
-	videoArgs := []string{
-		"-c:v", "libx264",
-		"-preset", "fast",
-		"-crf", "20",
-		"-g", defaultTranscodeGOP,
-		"-pix_fmt", "yuv420p",
-		"-an",
-		"-f", "mp4",
-		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
-		"pipe:1",
-	}
-
-	switch cfg.Preset {
-	case "overlay":
-		overlayImage := cfg.OverlayImage
-		if overlayImage == "" {
-			overlayImage = "/app/overlays/cf-logo.png"
-		}
-
-		position := cfg.OverlayPosition
-		if position == "" {
-			position = "top-right"
-		}
-
-		var xExpr, yExpr string
-		switch position {
-		case "top-left":
-			xExpr = "10"
-			yExpr = "10"
-		case "bottom-left":
-			xExpr = "10"
-			yExpr = "H-h-10"
-		case "bottom-right":
-			xExpr = "W-w-10"
-			yExpr = "H-h-10"
-		case "top-right":
-			fallthrough
-		default:
-			xExpr = "W-w-10"
-			yExpr = "10"
-		}
-
-		filterComplex := "[1:v]format=rgba,scale=600:-1[logo];[0:v][logo]overlay=" + xExpr + ":" + yExpr + ":format=auto,format=yuv420p"
-
-		return append([]string{
-			"-y",
-			"-f", "webm",
-			"-i", videoInput,
-			"-i", overlayImage,
-			"-filter_complex", filterComplex,
-		}, videoArgs...)
-	case "passthrough":
-		fallthrough
-	default:
-		return append([]string{
-			"-y",
-			"-f", "webm",
-			"-i", videoInput,
-		}, videoArgs...)
+		return BuildPassthroughArgs(cfg, videoInput, output)
 	}
 }
 
 // BuildPassthroughArgs constructs ffmpeg arguments for WebSocket pass-through.
 //
 // Input is a WebM stream (from MediaRecorder) read from a pipe.
-// Output is H.264/AAC muxed to FLV for RTMP.
+// Output is H.264/AAC muxed to FLV for RTMP, or fragmented MP4 to stdout
+// when preview mode is enabled.
 //
 // videoInput should be the pipe path, e.g. "/dev/fd/3".
-func BuildPassthroughArgs(videoInput string, output string) []string {
-	return []string{
+func BuildPassthroughArgs(cfg Config, videoInput string, output string) []string {
+	args := []string{
 		"-y", // Overwrite output without asking.
 
 		// Video input from pipe.
@@ -150,17 +111,29 @@ func BuildPassthroughArgs(videoInput string, output string) []string {
 		// Video: transcode to H.264 for RTMP/FLV compatibility.
 		"-c:v", "libx264",
 		"-preset", "fast",
-		"-b:v", defaultTranscodeBitrate,
 		"-g", defaultTranscodeGOP,
 		"-pix_fmt", "yuv420p", // Ensure compatibility.
 
 		// No audio for Stage 1.
 		"-an",
-
-		// Output format and destination.
-		"-f", "flv",
-		output,
 	}
+
+	if cfg.PreviewMode {
+		args = append(args,
+			"-crf", "20",
+			"-f", "mp4",
+			"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+			"pipe:1",
+		)
+	} else {
+		args = append(args,
+			"-b:v", defaultTranscodeBitrate,
+			"-f", "flv",
+			output,
+		)
+	}
+
+	return args
 }
 
 // BuildOverlayArgs constructs ffmpeg arguments that composite a static image
@@ -202,7 +175,7 @@ func BuildOverlayArgs(cfg Config, videoInput string, output string) []string {
 
 	filterComplex := "[1:v]format=rgba,scale=600:-1[logo];[0:v][logo]overlay=" + xExpr + ":" + yExpr + ":format=auto,format=yuv420p"
 
-	return []string{
+	args := []string{
 		"-y",
 
 		// Input 0: live video from browser (WebM/VP8).
@@ -218,15 +191,174 @@ func BuildOverlayArgs(cfg Config, videoInput string, output string) []string {
 		// Video: transcode to H.264 for RTMP/FLV compatibility.
 		"-c:v", "libx264",
 		"-preset", "fast",
-		"-b:v", defaultTranscodeBitrate,
 		"-g", defaultTranscodeGOP,
 		"-pix_fmt", "yuv420p",
 
 		// No audio.
 		"-an",
-
-		// Output format and destination.
-		"-f", "flv",
-		output,
 	}
+
+	if cfg.PreviewMode {
+		args = append(args,
+			"-crf", "20",
+			"-f", "mp4",
+			"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+			"pipe:1",
+		)
+	} else {
+		args = append(args,
+			"-b:v", defaultTranscodeBitrate,
+			"-f", "flv",
+			output,
+		)
+	}
+
+	return args
+}
+
+// BuildAnimatedOverlayArgs constructs ffmpeg arguments that composite a
+// real-time RGBA overlay stream (generated by Go) onto the live video.
+//
+// Input 0: live video from browser (WebM/VP8) via videoInput pipe.
+// Input 1: raw RGBA overlay frames via /dev/fd/4 pipe.
+func BuildAnimatedOverlayArgs(cfg Config, videoInput string, output string) []string {
+	w := cfg.OverlayWidth
+	if w == 0 {
+		w = 1280
+	}
+	h := cfg.OverlayHeight
+	if h == 0 {
+		h = 720
+	}
+
+	// Base video encoding args.
+	videoArgs := []string{
+		"-c:v", "libx264",
+		"-preset", "fast",
+		"-b:v", defaultTranscodeBitrate,
+		"-g", defaultTranscodeGOP,
+		"-pix_fmt", "yuv420p",
+		"-an",
+	}
+
+	// Output format depends on preview mode.
+	if cfg.PreviewMode {
+		videoArgs = append(videoArgs,
+			"-f", "mp4",
+			"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+			"pipe:1",
+		)
+	} else {
+		videoArgs = append(videoArgs,
+			"-f", "flv",
+			output,
+		)
+	}
+
+	return append([]string{
+		"-y",
+
+		// Input 0: live video from browser.
+		"-f", "webm",
+		"-i", videoInput,
+
+		// Input 1: raw RGBA overlay from Go frame generator.
+		"-f", "rawvideo",
+		"-pix_fmt", "rgba",
+		"-s", fmt.Sprintf("%dx%d", w, h),
+		"-r", "30",
+		"-i", "/dev/fd/4",
+
+		// Composite overlay on top of video.
+		"-filter_complex", "[0:v][1:v]overlay=0:0:format=auto",
+	}, videoArgs...)
+}
+
+// BuildFilterArgs constructs ffmpeg arguments with a dynamic filter chain.
+// Supported filters: blur, brightness, contrast, saturation, gamma, sharpen,
+// flip, rotate.
+func BuildFilterArgs(cfg Config, videoInput string, output string) []string {
+	f := cfg.Filters
+
+	// Build the filter_complex chain.
+	var filters []string
+
+	// eq filter: brightness, contrast, saturation, gamma.
+	var eqParts []string
+	if f.Brightness != 0 {
+		eqParts = append(eqParts, fmt.Sprintf("brightness=%.2f", f.Brightness))
+	}
+	if f.Contrast != 1.0 {
+		eqParts = append(eqParts, fmt.Sprintf("contrast=%.2f", f.Contrast))
+	}
+	if f.Saturation != 1.0 {
+		eqParts = append(eqParts, fmt.Sprintf("saturation=%.2f", f.Saturation))
+	}
+	if f.Gamma != 1.0 {
+		eqParts = append(eqParts, fmt.Sprintf("gamma=%.2f", f.Gamma))
+	}
+	if len(eqParts) > 0 {
+		filters = append(filters, "eq="+strings.Join(eqParts, ":"))
+	}
+
+	// boxblur.
+	if f.Blur > 0 {
+		filters = append(filters, fmt.Sprintf("boxblur=%.1f:1", f.Blur))
+	}
+
+	// unsharp (sharpen).
+	if f.Sharpen > 0 {
+		filters = append(filters, fmt.Sprintf("unsharp=3:3:%.1f", f.Sharpen))
+	}
+
+	// hflip.
+	if f.Flip {
+		filters = append(filters, "hflip")
+	}
+
+	// transpose (rotate).
+	switch f.Rotate {
+	case 90:
+		filters = append(filters, "transpose=1")
+	case 180:
+		filters = append(filters, "transpose=2,transpose=2")
+	case 270:
+		filters = append(filters, "transpose=2")
+	}
+
+	// Ensure yuv420p output for compatibility.
+	filters = append(filters, "format=yuv420p")
+
+	filterComplex := strings.Join(filters, ",")
+
+	// Base video encoding args.
+	videoArgs := []string{
+		"-c:v", "libx264",
+		"-preset", "fast",
+		"-b:v", defaultTranscodeBitrate,
+		"-g", defaultTranscodeGOP,
+		"-pix_fmt", "yuv420p",
+		"-an",
+	}
+
+	// Output format depends on preview mode.
+	if cfg.PreviewMode {
+		videoArgs = append(videoArgs,
+			"-f", "mp4",
+			"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+			"pipe:1",
+		)
+	} else {
+		videoArgs = append(videoArgs,
+			"-f", "flv",
+			output,
+		)
+	}
+
+	return append([]string{
+		"-y",
+		"-f", "webm",
+		"-i", videoInput,
+		"-filter_complex", filterComplex,
+	}, videoArgs...)
 }

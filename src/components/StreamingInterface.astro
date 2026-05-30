@@ -40,8 +40,12 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
       
       {showOverlayPreview && (
         <div class="overlay-preview">
-          <p class="overlay-label">Logo to be overlaid:</p>
-          <img src="/cf-logo.png" alt="Cloudflare logo" class="overlay-logo" />
+          <p class="overlay-label" id="overlayLabel">Logo to be overlaid:</p>
+          {preset === "animated-overlay" ? (
+            <p class="overlay-time" id="overlayTime">--:--:--</p>
+          ) : (
+            <img src="/cf-logo.png" alt="Cloudflare logo" class="overlay-logo" />
+          )}
         </div>
       )}
     </div>
@@ -91,14 +95,16 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     </div>
   </div>
 
-  <div class="info">
-    <h3>How it works</h3>
-    <ol>
-      {howItWorksSteps.map(step => (
-        <li set:html={step} />
-      ))}
-    </ol>
-    <slot name="back-link" />
+    <slot />
+
+    <div class="info">
+      <h3>How it works</h3>
+      <ol>
+        {howItWorksSteps.map(step => (
+          <li set:html={step} />
+        ))}
+      </ol>
+    </div>
   </div>
 </main>
 
@@ -240,12 +246,16 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     bufferQueue = [];
     isSourceBufferReady = false;
     previewVideo.src = "";
-    previewVideo.style.display = "none";
-    streamOutputWrapper.style.display = "block";
-    outputTitle.textContent = "Stream Output";
-    latencyText.innerHTML = "<strong>Note:</strong> RTMP ingest has ~2s network latency. The Cloudflare Stream output above shows 10-15s latency due to transcoding and HLS packaging.";
-    if (ffplaySection) ffplaySection.style.display = "";
-    if (ffplayHint) ffplayHint.style.display = "";
+
+    // Only revert to Stream Output layout if preview mode is OFF.
+    if (!isPreviewMode()) {
+      previewVideo.style.display = "none";
+      streamOutputWrapper.style.display = "block";
+      outputTitle.textContent = "Stream Output";
+        latencyText.innerHTML = "<strong>Note:</strong> RTMP ingest has network latency. The Cloudflare Stream output above shows additional latency due to transcoding and HLS packaging.";
+      if (ffplaySection) ffplaySection.style.display = "";
+      if (ffplayHint) ffplayHint.style.display = "";
+    }
   }
 
   async function startStreaming() {
@@ -256,7 +266,7 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
         streamOutputWrapper.style.display = "none";
         previewVideo.style.display = "block";
         outputTitle.textContent = "Live Preview";
-        latencyText.innerHTML = "<strong>Note:</strong> Low-latency preview via WebSocket (~300-500ms). Processed video is sent directly from the container back to your browser using MediaSource Extensions.";
+        latencyText.innerHTML = "<strong>Note:</strong> Low-latency preview via WebSocket. Processed video is sent directly from the container back to your browser using MediaSource Extensions.";
         if (ffplaySection) ffplaySection.style.display = "none";
         if (ffplayHint) ffplayHint.style.display = "none";
       }
@@ -291,7 +301,37 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
           config.overlay_position = "top-right";
         }
         
+        if (preset === "animated-overlay") {
+          config.overlay_width = 1280;
+          config.overlay_height = 720;
+          config.timezone_offset_min = -new Date().getTimezoneOffset();
+        }
+        
+        if (preset === "filters") {
+          // If the filters page exposed current values, use them. Otherwise
+          // fall back to defaults.
+          if (window.getFilterValues) {
+            config.filters = window.getFilterValues();
+          } else {
+            config.filters = {
+              blur: 0,
+              brightness: 0,
+              contrast: 1.0,
+              saturation: 1.0,
+              gamma: 1.0,
+              sharpen: 0,
+              flip: false,
+              rotate: 0
+            };
+          }
+        }
+        
         ws.send(JSON.stringify(config));
+
+        // Expose WebSocket to parent page (e.g., filters page needs it).
+        if (window.setFiltersWebSocket) {
+          window.setFiltersWebSocket(ws);
+        }
 
         if (usePreview) {
           if (!initMSE()) {
@@ -400,6 +440,17 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
   startBtn.addEventListener("click", startStreaming);
   stopBtn.addEventListener("click", stopStreaming);
 
+  // Expose restart function so the filters page can trigger a full
+  // stop/start cycle when filter values change. This gives us a clean
+  // WebSocket connection and a fresh MediaRecorder header, avoiding the
+  // mid-stream ffmpeg restart complexity.
+  window.restartStreaming = async function () {
+    stopStreaming();
+    // Small delay to let cleanup finish before starting again.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await startStreaming();
+  };
+
   // Copy button for ffplay command
   const copyBtn = document.getElementById("copyBtn");
   const ffplayCmd = document.getElementById("ffplayCmd");
@@ -432,6 +483,23 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
       latencyText.innerHTML = "<strong>Note:</strong> Low-latency preview via WebSocket (~300-500ms). Processed video is sent directly from the container back to your browser using MediaSource Extensions.";
       if (ffplaySection) ffplaySection.style.display = "none";
       if (ffplayHint) ffplayHint.style.display = "none";
+    }
+  }
+
+  // For animated-overlay preset, update the overlay preview time every 100ms.
+  if (preset === "animated-overlay") {
+    const overlayTime = document.getElementById("overlayTime");
+    const overlayLabel = document.getElementById("overlayLabel");
+    if (overlayLabel) overlayLabel.textContent = "Overlay text to be rendered:";
+    if (overlayTime) {
+      setInterval(() => {
+        const now = new Date();
+        const hh = String(now.getHours()).padStart(2, "0");
+        const mm = String(now.getMinutes()).padStart(2, "0");
+        const ss = String(now.getSeconds()).padStart(2, "0");
+        const ms = String(now.getMilliseconds()).padStart(3, "0");
+        overlayTime.textContent = `${hh}:${mm}:${ss}.${ms}`;
+      }, 100);
     }
   }
 
@@ -692,6 +760,19 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     height: auto;
   }
 
+  .overlay-time {
+    font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: #fff;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+    margin: 0;
+    padding: 0.5rem;
+    background: rgba(0, 0, 0, 0.5);
+    border-radius: 4px;
+    display: inline-block;
+  }
+
   .hint {
     font-size: 0.875rem;
     margin: 0.5rem 0;
@@ -699,18 +780,5 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
 
   .hint a {
     color: #f48120;
-  }
-
-  .back-link {
-    margin-top: 1.5rem;
-  }
-
-  .back-link a {
-    color: #f48120;
-    text-decoration: none;
-  }
-
-  .back-link a:hover {
-    text-decoration: underline;
   }
 </style>

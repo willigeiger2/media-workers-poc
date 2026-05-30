@@ -20,6 +20,7 @@ RUN go mod download
 COPY container/main.go container/handler.go ./
 COPY container/ffmpeg/ ./ffmpeg/
 COPY container/media/ ./media/
+COPY container/overlay/ ./overlay/
 
 RUN go build -trimpath -o /media-poc ./main.go ./handler.go
 
@@ -32,7 +33,7 @@ FROM alpine:3.21
 COPY container/CloudflareRootCertificateCombined.pem /usr/local/share/ca-certificates/Cloudflare_CA.crt
 RUN cat /usr/local/share/ca-certificates/Cloudflare_CA.crt >> /etc/ssl/certs/ca-certificates.crt
 
-RUN apk add --no-cache ca-certificates ffmpeg
+RUN apk add --no-cache ca-certificates ffmpeg font-liberation font-dejavu
 
 # Copy overlay assets into the image.
 COPY cf-logo.png /app/overlays/cf-logo.png

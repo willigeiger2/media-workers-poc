@@ -1,0 +1,251 @@
+---
+import Layout from "../layouts/Layout.astro";
+import StreamingInterface from "../components/StreamingInterface.astro";
+
+const howItWorksSteps = [
+  "Click <strong>Start Streaming</strong> to capture your webcam",
+  "Video chunks are sent via WebSocket to the Worker",
+  "Worker proxies chunks to the Go container",
+  "Container runs ffmpeg with a <strong>filter_complex</strong> chain built from your slider settings",
+  "Adjust sliders in real-time — ffmpeg restarts with new parameters",
+  "Output goes to Cloudflare Stream or back to the browser preview"
+];
+---
+
+<Layout title="Media Workers PoC — Filters">
+  <StreamingInterface
+    title="Real-Time Video Filters"
+    description="Capture webcam video and apply adjustable filters in the container using ffmpeg. Drag the sliders to see the effect — the container rebuilds the filter chain and restarts ffmpeg automatically."
+    preset="filters"
+    howItWorksSteps={howItWorksSteps}
+  >
+    <div class="filters-panel" id="filtersPanel">
+      <h3>Filter Controls</h3>
+      
+      <div class="filter-grid">
+        <div class="filter-control">
+          <label for="blur">Blur</label>
+          <input type="range" id="blur" min="0" max="10" step="0.5" value="0" />
+          <span class="filter-value" id="blurValue">0</span>
+        </div>
+
+        <div class="filter-control">
+          <label for="brightness">Brightness</label>
+          <input type="range" id="brightness" min="-1" max="1" step="0.05" value="0" />
+          <span class="filter-value" id="brightnessValue">0</span>
+        </div>
+
+        <div class="filter-control">
+          <label for="contrast">Contrast</label>
+          <input type="range" id="contrast" min="0" max="2" step="0.05" value="1" />
+          <span class="filter-value" id="contrastValue">1.0</span>
+        </div>
+
+        <div class="filter-control">
+          <label for="saturation">Saturation</label>
+          <input type="range" id="saturation" min="0" max="2" step="0.05" value="1" />
+          <span class="filter-value" id="saturationValue">1.0</span>
+        </div>
+
+        <div class="filter-control">
+          <label for="gamma">Gamma</label>
+          <input type="range" id="gamma" min="0.1" max="3" step="0.05" value="1" />
+          <span class="filter-value" id="gammaValue">1.0</span>
+        </div>
+
+        <div class="filter-control">
+          <label for="sharpen">Sharpen</label>
+          <input type="range" id="sharpen" min="0" max="5" step="0.1" value="0" />
+          <span class="filter-value" id="sharpenValue">0</span>
+        </div>
+
+        <div class="filter-control">
+          <label class="checkbox-label">
+            <input type="checkbox" id="flip" />
+            <span>Flip Horizontal</span>
+          </label>
+        </div>
+
+        <div class="filter-control">
+          <label for="rotate">Rotate</label>
+          <select id="rotate">
+            <option value="0">0°</option>
+            <option value="90">90°</option>
+            <option value="180">180°</option>
+            <option value="270">270°</option>
+          </select>
+        </div>
+      </div>
+
+      <div id="filterStatus" class="filter-status"></div>
+    </div>
+  </StreamingInterface>
+</Layout>
+
+<script>
+  const sliders = {
+    blur: document.getElementById("blur"),
+    brightness: document.getElementById("brightness"),
+    contrast: document.getElementById("contrast"),
+    saturation: document.getElementById("saturation"),
+    gamma: document.getElementById("gamma"),
+    sharpen: document.getElementById("sharpen"),
+    flip: document.getElementById("flip"),
+    rotate: document.getElementById("rotate"),
+  };
+
+  const valueLabels = {
+    blur: document.getElementById("blurValue"),
+    brightness: document.getElementById("brightnessValue"),
+    contrast: document.getElementById("contrastValue"),
+    saturation: document.getElementById("saturationValue"),
+    gamma: document.getElementById("gammaValue"),
+    sharpen: document.getElementById("sharpenValue"),
+  };
+
+  const filterStatus = document.getElementById("filterStatus");
+  let ws = null;
+  let debounceTimer = null;
+
+  function getFilterValues() {
+    return {
+      blur: parseFloat(sliders.blur.value),
+      brightness: parseFloat(sliders.brightness.value),
+      contrast: parseFloat(sliders.contrast.value),
+      saturation: parseFloat(sliders.saturation.value),
+      gamma: parseFloat(sliders.gamma.value),
+      sharpen: parseFloat(sliders.sharpen.value),
+      flip: sliders.flip.checked,
+      rotate: parseInt(sliders.rotate.value),
+    };
+  }
+
+  function showFilterStatus(message) {
+    filterStatus.textContent = message;
+    filterStatus.style.display = "block";
+    if (message === "") {
+      filterStatus.style.display = "none";
+    }
+  }
+
+  function sendFilterUpdate() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    // Instead of sending a mid-stream message (which causes ffmpeg restart
+    // headaches because the WebM header was already sent), trigger a full
+    // stop/restart cycle. The new MediaRecorder will generate a fresh WebM
+    // header, and the container will start a new ffmpeg with the updated
+    // filters automatically.
+    if (window.restartStreaming) {
+      showFilterStatus("Restarting stream with new filters…");
+      window.restartStreaming();
+    }
+  }
+
+  function onFilterChange() {
+    // Update value labels.
+    valueLabels.blur.textContent = sliders.blur.value;
+    valueLabels.brightness.textContent = sliders.brightness.value;
+    valueLabels.contrast.textContent = sliders.contrast.value;
+    valueLabels.saturation.textContent = sliders.saturation.value;
+    valueLabels.gamma.textContent = sliders.gamma.value;
+    valueLabels.sharpen.textContent = sliders.sharpen.value;
+
+    // Debounce filter updates by 500ms.
+    if (debounceTimer) {
+      clearTimeout(debounceTimer);
+    }
+    debounceTimer = setTimeout(() => {
+      sendFilterUpdate();
+    }, 500);
+  }
+
+  // Attach listeners to all controls.
+  Object.values(sliders).forEach((el) => {
+    if (el) {
+      el.addEventListener("input", onFilterChange);
+      el.addEventListener("change", onFilterChange);
+    }
+  });
+
+  // Expose functions for the streaming interface.
+  window.getFilterValues = getFilterValues;
+
+  window.setFiltersWebSocket = function (websocket) {
+    ws = websocket;
+  };
+</script>
+
+<style>
+  .filters-panel {
+    max-width: 1200px;
+    margin: 0 auto 2rem auto;
+    padding: 1.5rem;
+    background: #f5f5f5;
+    border-radius: 8px;
+  }
+
+  .filters-panel h3 {
+    margin-top: 0;
+    margin-bottom: 1rem;
+  }
+
+  .filter-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    gap: 1rem;
+  }
+
+  .filter-control {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .filter-control label {
+    font-weight: 600;
+    font-size: 0.875rem;
+    color: #333;
+  }
+
+  .filter-control input[type="range"] {
+    width: 100%;
+  }
+
+  .filter-control select {
+    padding: 0.5rem;
+    border-radius: 4px;
+    border: 1px solid #ccc;
+    font-size: 1rem;
+  }
+
+  .filter-value {
+    font-family: monospace;
+    font-size: 0.875rem;
+    color: #666;
+  }
+
+  .checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    cursor: pointer;
+  }
+
+  .checkbox-label input[type="checkbox"] {
+    width: 1.25rem;
+    height: 1.25rem;
+    accent-color: #f48120;
+  }
+
+  .filter-status {
+    display: none;
+    margin-top: 1rem;
+    padding: 0.5rem;
+    background: #fff3e0;
+    border-radius: 4px;
+    font-size: 0.875rem;
+    color: #e65100;
+    text-align: center;
+  }
+</style>

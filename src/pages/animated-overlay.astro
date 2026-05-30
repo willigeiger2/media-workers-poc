@@ -1,0 +1,24 @@
+---
+import Layout from "../layouts/Layout.astro";
+import StreamingInterface from "../components/StreamingInterface.astro";
+
+const howItWorksSteps = [
+  "Click <strong>Start Streaming</strong> to capture your webcam",
+  "Browser sends video chunks via WebSocket to the Worker",
+  "Worker proxies chunks to the Go container",
+  "Container starts a <strong>Go frame generator</strong> that renders the current time using a 2D graphics API (gg)",
+  "The generator writes raw RGBA frames to a pipe at 30fps",
+  "ffmpeg composites the overlay frames on top of the live video",
+  "Output goes to Cloudflare Stream or back to the browser preview"
+];
+---
+
+<Layout title="Media Workers PoC — Animated Overlay">
+  <StreamingInterface
+    title="Animated Text Overlay"
+    description="Capture webcam video and composite a real-time animated text overlay rendered in the container using a Go 2D graphics library. The overlay updates every frame at 30fps."
+    preset="animated-overlay"
+    showOverlayPreview={true}
+    howItWorksSteps={howItWorksSteps}
+  />
+</Layout>
