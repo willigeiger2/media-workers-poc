@@ -96,10 +96,41 @@ func (h *StreamHandler) runStreamSource(cfg ffmpeg.Config, streamURL string) err
 		}
 	}
 
+	isAnimatedOverlay := cfg.Preset == "animated-overlay"
+
 	// Step 1: Create a pipe for ffmpeg video input.
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("failed to create pipe: %w", err)
+	}
+
+	// Step 1b: For animated overlay, create a second pipe and start frame generator.
+	var overlayPr, overlayPw *os.File
+	var frameGenDone chan error
+	var genDone chan struct{}
+	if isAnimatedOverlay {
+		overlayPr, overlayPw, err = os.Pipe()
+		if err != nil {
+			pr.Close()
+			pw.Close()
+			return fmt.Errorf("failed to create overlay pipe: %w", err)
+		}
+
+		gen := overlay.NewFrameGenerator()
+		gen.Width = cfg.OverlayWidth
+		if gen.Width == 0 {
+			gen.Width = 1280
+		}
+		gen.Height = cfg.OverlayHeight
+		if gen.Height == 0 {
+			gen.Height = 720
+		}
+		gen.TimezoneOffsetMin = cfg.TimezoneOffsetMin
+		genDone = make(chan struct{})
+		frameGenDone = make(chan error, 1)
+		go func() {
+			frameGenDone <- gen.Run(overlayPw, genDone)
+		}()
 	}
 
 	// Step 2: Start HLS segment downloader goroutine.
@@ -114,13 +145,21 @@ func (h *StreamHandler) runStreamSource(cfg ffmpeg.Config, streamURL string) err
 	}()
 
 	// Step 3: Build ffmpeg arguments and start ffmpeg.
-	// For stream source we feed MPEG-TS segments through /dev/fd/3.
-	args := ffmpeg.BuildArgs(cfg, "/dev/fd/3", streamURL)
+	var args []string
+	if isAnimatedOverlay {
+		args = ffmpeg.BuildAnimatedOverlayArgs(cfg, "/dev/fd/3", streamURL)
+	} else {
+		args = ffmpeg.BuildArgs(cfg, "/dev/fd/3", streamURL)
+	}
 	h.logger.Printf("Starting ffmpeg (stream source via pipe): %v", args)
 
 	cmd := exec.Command("ffmpeg", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.ExtraFiles = []*os.File{pr}
+	if isAnimatedOverlay {
+		cmd.ExtraFiles = []*os.File{pr, overlayPr}
+	} else {
+		cmd.ExtraFiles = []*os.File{pr}
+	}
 	cmd.Stderr = os.Stderr
 
 	var ffmpegOut io.ReadCloser
@@ -128,6 +167,9 @@ func (h *StreamHandler) runStreamSource(cfg ffmpeg.Config, streamURL string) err
 		ffmpegOut, err = cmd.StdoutPipe()
 		if err != nil {
 			pr.Close()
+			if overlayPr != nil {
+				overlayPr.Close()
+			}
 			return fmt.Errorf("failed to create stdout pipe: %w", err)
 		}
 	} else {
@@ -136,11 +178,17 @@ func (h *StreamHandler) runStreamSource(cfg ffmpeg.Config, streamURL string) err
 
 	if err := cmd.Start(); err != nil {
 		pr.Close()
+		if overlayPr != nil {
+			overlayPr.Close()
+		}
 		return fmt.Errorf("failed to start ffmpeg: %w", err)
 	}
 
-	// Close read end in parent — only ffmpeg reads it.
+	// Close read ends in parent — only ffmpeg reads them.
 	pr.Close()
+	if overlayPr != nil {
+		overlayPr.Close()
+	}
 
 	// In preview mode, proxy ffmpeg stdout back to the WebSocket.
 	var previewDone chan error
@@ -169,6 +217,9 @@ func (h *StreamHandler) runStreamSource(cfg ffmpeg.Config, streamURL string) err
 
 	select {
 	case err := <-ffmpegDone:
+		if isAnimatedOverlay {
+			close(genDone)
+		}
 		if err != nil {
 			h.logger.Printf("ffmpeg exited with error: %v", err)
 			h.conn.Close()
@@ -179,6 +230,9 @@ func (h *StreamHandler) runStreamSource(cfg ffmpeg.Config, streamURL string) err
 
 	case <-wsClose:
 		h.logger.Printf("WebSocket closed, killing ffmpeg")
+		if isAnimatedOverlay {
+			close(genDone)
+		}
 		cmd.Process.Kill()
 		<-ffmpegDone
 		return nil

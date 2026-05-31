@@ -38,12 +38,11 @@ const howItWorksSteps = [
         <p class="status-text">Click <strong>Start Streaming</strong> to begin processing.</p>
       </div>
 
-      <div class="subtitle-preview" id="subtitlePreview" style="display: none;">
-        <img id="subtitleThumbnail" src="" alt="Video thumbnail" />
-        <div class="subtitle-overlay">
-          <div class="subtitle-badge">Subtitles</div>
-          <div class="subtitle-lang" id="subtitleLang">Language: —</div>
-          <div class="subtitle-cues" id="subtitleCues">Cues: —</div>
+      <div class="subtitle-info" id="subtitleInfo" style="display: none;">
+        <div class="subtitle-badge">Subtitles</div>
+        <div class="subtitle-meta">
+          <span id="subtitleLang">Language: —</span>
+          <span id="subtitleCues">Cues: —</span>
         </div>
       </div>
     </div>
@@ -53,8 +52,7 @@ const howItWorksSteps = [
 <script>
   const videoIdInput = document.getElementById("subtitleVideoId");
   const subtitleStatus = document.getElementById("subtitleStatus");
-  const subtitlePreview = document.getElementById("subtitlePreview");
-  const subtitleThumbnail = document.getElementById("subtitleThumbnail");
+  const subtitleInfo = document.getElementById("subtitleInfo");
   const subtitleLang = document.getElementById("subtitleLang");
   const subtitleCues = document.getElementById("subtitleCues");
 
@@ -78,14 +76,12 @@ const howItWorksSteps = [
     subtitleStatus.style.display = "block";
   }
 
-  function showSubtitlePreview(videoId) {
-    const thumbnailUrl = `https://videodelivery.net/${videoId}/thumbnails/thumbnail.jpg?time=2s&height=320`;
-    subtitleThumbnail.src = thumbnailUrl;
-    subtitlePreview.style.display = "block";
+  function showSubtitleInfo() {
+    subtitleInfo.style.display = "flex";
   }
 
-  function hideSubtitlePreview() {
-    subtitlePreview.style.display = "none";
+  function hideSubtitleInfo() {
+    subtitleInfo.style.display = "none";
   }
 
   // Override the startStreaming for this page to include subtitle config.
@@ -108,19 +104,24 @@ const howItWorksSteps = [
     }
 
     updateSubtitleStatus("Fetching subtitles and starting stream...", "info");
-    showSubtitlePreview(videoId);
+    showSubtitleInfo();
 
-    // Call the original startStreaming which will pick up the video ID from settings.
-    // We temporarily override the video ID in settings.
+    // Temporarily override the video ID in settings and enable subtitles.
     const originalVideoId = settings.videoId;
     settings.videoId = videoId;
     localStorage.setItem("mediaWorkersSettings", JSON.stringify(settings));
+    window.burnSubtitles = true;
+    console.log("[subtitles] Set window.burnSubtitles = true");
 
     try {
+      console.log("[subtitles] Calling originalStartStreaming...");
       await originalStartStreaming.call(this);
+      console.log("[subtitles] originalStartStreaming returned");
       updateSubtitleStatus("Streaming with subtitle burn-in...", "success");
     } catch (err) {
+      console.error("[subtitles] Error:", err);
       updateSubtitleStatus(`Error: ${err.message}`, "error");
+      window.burnSubtitles = false; // clear on error only
     } finally {
       // Restore original video ID.
       settings.videoId = originalVideoId;
@@ -198,33 +199,22 @@ const howItWorksSteps = [
     color: #2e7d32;
   }
 
-  .subtitle-preview {
+  .subtitle-info {
     margin-top: 1rem;
-    position: relative;
-    width: 100%;
-    aspect-ratio: 16 / 9;
-    border-radius: 4px;
-    overflow: hidden;
-    background: #000;
-  }
-
-  .subtitle-preview img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-  }
-
-  .subtitle-overlay {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    padding: 1rem;
-    background: linear-gradient(transparent, rgba(0, 0, 0, 0.8));
-    color: white;
     display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.75rem 1rem;
+    background: #fff;
+    border-radius: 4px;
+    border: 1px solid #ddd;
+  }
+
+  .subtitle-meta {
+    display: flex;
+    gap: 1.5rem;
+    font-size: 0.875rem;
+    color: #333;
   }
 
   .subtitle-badge {
@@ -236,11 +226,5 @@ const howItWorksSteps = [
     padding: 0.25rem 0.5rem;
     border-radius: 4px;
     width: fit-content;
-  }
-
-  .subtitle-lang,
-  .subtitle-cues {
-    font-size: 0.875rem;
-    opacity: 0.9;
   }
 </style>

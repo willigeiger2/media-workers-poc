@@ -177,19 +177,20 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
           const current = previewVideo.currentTime;
           const drift = liveEdge - current;
 
-          // For live sources, aggressively seek to keep playhead near the
-          // live edge (low-latency preview). For VOD/stream sources, let
-          // the video play naturally — only seek if we somehow fell very
-          // far behind.
+          // For live sources, keep playhead near the live edge but don't
+          // seek so aggressively that playback becomes choppy.  A ~2s
+          // buffer is normal for transcoded webcam preview.
           if (isLive) {
-            if (drift > 1.5) {
-              const target = Math.max(0, liveEdge - 0.3);
+            if (drift > 3.0) {
+              const target = Math.max(0, liveEdge - 1.0);
+              console.log(`[MSE-live] drift=${drift.toFixed(2)}s, seeking to ${target.toFixed(2)}s (liveEdge=${liveEdge.toFixed(2)}s)`);
               previewVideo.currentTime = target;
             }
           } else {
             // VOD: only seek if we've drifted more than 10s behind.
             if (drift > 10) {
               const target = Math.max(0, liveEdge - 1);
+              console.log(`[MSE-vod] drift=${drift.toFixed(2)}s, seeking to ${target.toFixed(2)}s`);
               previewVideo.currentTime = target;
             }
           }
@@ -331,6 +332,12 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
         config.overlay_position = "top-right";
       }
 
+      if (preset === "animated-overlay") {
+        config.overlay_width = 1280;
+        config.overlay_height = 720;
+        config.timezone_offset_min = -new Date().getTimezoneOffset();
+      }
+
       if (preset === "filters") {
         if (window.getFilterValues) {
           config.filters = window.getFilterValues();
@@ -348,7 +355,20 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
         }
       }
 
+      // Subtitle burn-in: subtitles page sets window.burnSubtitles = true.
+      console.log("[stream] Checking window.burnSubtitles:", window.burnSubtitles);
+      if (window.burnSubtitles) {
+        config.burn_subtitles = true;
+        window.burnSubtitles = false; // consume the flag
+        console.log("[stream] Set config.burn_subtitles = true");
+      }
+
+      console.log("[stream] Sending config:", config);
       ws.send(JSON.stringify(config));
+
+      if (window.setFiltersWebSocket) {
+        window.setFiltersWebSocket(ws);
+      }
 
       if (usePreview) {
         if (!initMSE(false)) {
@@ -365,6 +385,23 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
       if (event.data instanceof ArrayBuffer) {
         if (usePreview) {
           appendToBuffer(new Uint8Array(event.data));
+        }
+      } else if (typeof event.data === "string") {
+        // Handle text messages from backend (subtitle info, warnings, etc.)
+        console.log("[stream] Backend message:", event.data);
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.subtitle_lang) {
+            const langEl = document.getElementById("subtitleLang");
+            const cuesEl = document.getElementById("subtitleCues");
+            if (langEl) langEl.textContent = `Language: ${msg.subtitle_lang}`;
+            if (cuesEl) cuesEl.textContent = `Cues: ${msg.subtitle_cues}`;
+          }
+          if (msg.warning) {
+            setStatus(msg.warning, "warning");
+          }
+        } catch (e) {
+          console.log("[stream] Non-JSON text message:", event.data);
         }
       }
     });
@@ -589,7 +626,11 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     stopBtn.disabled = true;
   }
 
-  startBtn.addEventListener("click", startStreaming);
+  // Expose startStreaming so other pages (e.g. subtitles) can wrap or
+  // override it to inject extra config before the stream begins.
+  window.startStreaming = startStreaming;
+
+  startBtn.addEventListener("click", () => window.startStreaming());
   stopBtn.addEventListener("click", stopStreaming);
 
   // Expose restart function so the filters page can trigger a full
