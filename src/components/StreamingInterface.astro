@@ -146,7 +146,7 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     return !!getSettings().previewMode;
   }
 
-  function initMSE() {
+  function initMSE(isLive) {
     if (!window.MediaSource) {
       setStatus("MediaSource Extensions not supported in this browser", "error");
       return false;
@@ -177,16 +177,28 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
           const current = previewVideo.currentTime;
           const drift = liveEdge - current;
 
-          // If playhead has drifted more than 1.5s behind live edge,
-          // seek forward to near the live edge.
-          if (drift > 1.5) {
-            const target = Math.max(0, liveEdge - 0.3);
-            previewVideo.currentTime = target;
+          // For live sources, aggressively seek to keep playhead near the
+          // live edge (low-latency preview). For VOD/stream sources, let
+          // the video play naturally — only seek if we somehow fell very
+          // far behind.
+          if (isLive) {
+            if (drift > 1.5) {
+              const target = Math.max(0, liveEdge - 0.3);
+              previewVideo.currentTime = target;
+            }
+          } else {
+            // VOD: only seek if we've drifted more than 10s behind.
+            if (drift > 10) {
+              const target = Math.max(0, liveEdge - 1);
+              previewVideo.currentTime = target;
+            }
           }
 
           // Prune buffer older than 2s behind current playhead to prevent
-          // unbounded memory growth.
-          const pruneEnd = current - 2;
+          // unbounded memory growth. For VOD, be gentler (prune only when
+          // buffer is very large).
+          const pruneThreshold = isLive ? 2 : 30;
+          const pruneEnd = current - pruneThreshold;
           if (pruneEnd > 0 && !sourceBuffer.updating) {
             try {
               sourceBuffer.remove(0, pruneEnd);
@@ -261,6 +273,8 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
   async function startStreaming() {
     try {
       const usePreview = isPreviewMode();
+      const settings = getSettings();
+      const isStreamSource = settings.sourceType === "stream";
 
       if (usePreview) {
         streamOutputWrapper.style.display = "none";
@@ -271,111 +285,248 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
         if (ffplayHint) ffplayHint.style.display = "none";
       }
 
-      setStatus("Requesting camera access...");
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 1280, height: 720, frameRate: 30 },
-        audio: false,
-      });
-      localVideo.srcObject = stream;
-
-      setStatus("Connecting to server...");
-      const wsUrl = `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/api/stream`;
-      ws = new WebSocket(wsUrl);
-      ws.binaryType = "arraybuffer";
-
-      ws.addEventListener("open", () => {
-        setStatus("Connected. Sending config...", "success");
-
-        const settings = getSettings();
-        const config = {
-          preset: preset,
-          preview_mode: usePreview,
-        };
-        
-        if (settings.streamUrl && !usePreview) {
-          config.stream_url = settings.streamUrl;
-        }
-        
-        if (preset === "overlay") {
-          config.overlay_image = "/app/overlays/cf-logo.png";
-          config.overlay_position = "top-right";
-        }
-        
-        if (preset === "animated-overlay") {
-          config.overlay_width = 1280;
-          config.overlay_height = 720;
-          config.timezone_offset_min = -new Date().getTimezoneOffset();
-        }
-        
-        if (preset === "filters") {
-          // If the filters page exposed current values, use them. Otherwise
-          // fall back to defaults.
-          if (window.getFilterValues) {
-            config.filters = window.getFilterValues();
-          } else {
-            config.filters = {
-              blur: 0,
-              brightness: 0,
-              contrast: 1.0,
-              saturation: 1.0,
-              gamma: 1.0,
-              sharpen: 0,
-              flip: false,
-              rotate: 0
-            };
-          }
-        }
-        
-        ws.send(JSON.stringify(config));
-
-        // Expose WebSocket to parent page (e.g., filters page needs it).
-        if (window.setFiltersWebSocket) {
-          window.setFiltersWebSocket(ws);
-        }
-
-        if (usePreview) {
-          if (!initMSE()) {
-            setStatus("Preview mode not supported in this browser", "error");
-            cleanup();
-            return;
-          }
-        }
-
-        // Wait a tick for the text message to be transmitted before
-        // starting MediaRecorder, to avoid a race where the first binary
-        // chunk arrives at the container before the config text message.
-        setTimeout(() => {
-          startMediaRecorder(usePreview);
-        }, 50);
-      });
-
-      ws.addEventListener("message", (event) => {
-        if (event.data instanceof ArrayBuffer) {
-          // Binary message from container — this is preview video data
-          if (usePreview) {
-            appendToBuffer(new Uint8Array(event.data));
-          }
-        }
-      });
-
-      ws.addEventListener("close", (event) => {
-        setStatus(`Connection closed (${event.code})`);
-        cleanup();
-      });
-
-      ws.addEventListener("error", (error) => {
-        setStatus("WebSocket error", "error");
-        console.error("WebSocket error:", error);
-        cleanup();
-      });
-
-      startBtn.disabled = true;
-      stopBtn.disabled = false;
+      if (isStreamSource) {
+        await startStreamSource(settings, usePreview);
+      } else {
+        await startWebcamSource(settings, usePreview);
+      }
     } catch (err) {
       setStatus(`Error: ${err instanceof Error ? err.message : String(err)}`, "error");
       console.error("Start streaming error:", err);
       cleanup();
     }
+  }
+
+  async function startStreamSource(settings, usePreview) {
+    const videoId = settings.videoId || "";
+    if (!videoId) {
+      setStatus("No Stream Video ID configured. Go to Settings to set one.", "error");
+      return;
+    }
+
+    setStatus("Starting stream source processing...");
+    showStreamSourcePanel(videoId);
+
+    const wsUrl = `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/api/stream`;
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = "arraybuffer";
+
+    ws.addEventListener("open", () => {
+      setStatus("Connected. Sending config...", "success");
+
+      const videoUrl = `https://videodelivery.net/${videoId}/manifest/video.m3u8`;
+      const config = {
+        preset: preset,
+        preview_mode: usePreview,
+        source_type: "stream",
+        video_url: videoUrl,
+      };
+
+      if (settings.streamUrl && !usePreview) {
+        config.stream_url = settings.streamUrl;
+      }
+
+      if (preset === "overlay") {
+        config.overlay_image = "/app/overlays/cf-logo.png";
+        config.overlay_position = "top-right";
+      }
+
+      if (preset === "filters") {
+        if (window.getFilterValues) {
+          config.filters = window.getFilterValues();
+        } else {
+          config.filters = {
+            blur: 0,
+            brightness: 0,
+            contrast: 1.0,
+            saturation: 1.0,
+            gamma: 1.0,
+            sharpen: 0,
+            flip: false,
+            rotate: 0
+          };
+        }
+      }
+
+      ws.send(JSON.stringify(config));
+
+      if (usePreview) {
+        if (!initMSE(false)) {
+          setStatus("Preview mode not supported in this browser", "error");
+          cleanup();
+          return;
+        }
+      }
+
+      setStatus("Processing stream video...", "success");
+    });
+
+    ws.addEventListener("message", (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        if (usePreview) {
+          appendToBuffer(new Uint8Array(event.data));
+        }
+      }
+    });
+
+    ws.addEventListener("close", (event) => {
+      setStatus(`Connection closed (${event.code})`);
+      cleanup();
+    });
+
+    ws.addEventListener("error", (error) => {
+      setStatus("WebSocket error", "error");
+      console.error("WebSocket error:", error);
+      cleanup();
+    });
+
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+  }
+
+  async function startWebcamSource(settings, usePreview) {
+    setStatus("Requesting camera access...");
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 1280, height: 720, frameRate: 30 },
+      audio: false,
+    });
+    localVideo.srcObject = stream;
+
+    setStatus("Connecting to server...");
+    const wsUrl = `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/api/stream`;
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = "arraybuffer";
+
+    ws.addEventListener("open", () => {
+      setStatus("Connected. Sending config...", "success");
+
+      const config = {
+        preset: preset,
+        preview_mode: usePreview,
+      };
+      
+      if (settings.streamUrl && !usePreview) {
+        config.stream_url = settings.streamUrl;
+      }
+      
+      if (preset === "overlay") {
+        config.overlay_image = "/app/overlays/cf-logo.png";
+        config.overlay_position = "top-right";
+      }
+      
+      if (preset === "animated-overlay") {
+        config.overlay_width = 1280;
+        config.overlay_height = 720;
+        config.timezone_offset_min = -new Date().getTimezoneOffset();
+      }
+      
+      if (preset === "filters") {
+        if (window.getFilterValues) {
+          config.filters = window.getFilterValues();
+        } else {
+          config.filters = {
+            blur: 0,
+            brightness: 0,
+            contrast: 1.0,
+            saturation: 1.0,
+            gamma: 1.0,
+            sharpen: 0,
+            flip: false,
+            rotate: 0
+          };
+        }
+      }
+      
+      ws.send(JSON.stringify(config));
+
+      if (window.setFiltersWebSocket) {
+        window.setFiltersWebSocket(ws);
+      }
+
+      if (usePreview) {
+        if (!initMSE(true)) {
+          setStatus("Preview mode not supported in this browser", "error");
+          cleanup();
+          return;
+        }
+      }
+
+      setTimeout(() => {
+        startMediaRecorder(usePreview);
+      }, 50);
+    });
+
+    ws.addEventListener("message", (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        if (usePreview) {
+          appendToBuffer(new Uint8Array(event.data));
+        }
+      }
+    });
+
+    ws.addEventListener("close", (event) => {
+      setStatus(`Connection closed (${event.code})`);
+      cleanup();
+    });
+
+    ws.addEventListener("error", (error) => {
+      setStatus("WebSocket error", "error");
+      console.error("WebSocket error:", error);
+      cleanup();
+    });
+
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+  }
+
+  function showStreamSourcePanel(videoId) {
+    // Replace the local video with a stream source info panel.
+    const panel = localVideo.parentElement;
+    
+    // Hide the video element.
+    localVideo.style.display = "none";
+    
+    // Create or update the stream source info overlay.
+    let infoDiv = document.getElementById("streamSourceInfo");
+    if (!infoDiv) {
+      infoDiv = document.createElement("div");
+      infoDiv.id = "streamSourceInfo";
+      panel.insertBefore(infoDiv, localVideo.nextSibling);
+    }
+    
+    // Use explicit inline styles to ensure the panel renders correctly
+    // regardless of cached CSS.
+    infoDiv.style.display = "block";
+    infoDiv.style.width = "100%";
+    infoDiv.style.borderRadius = "4px";
+    infoDiv.style.overflow = "hidden";
+    infoDiv.style.background = "#000";
+    
+    const thumbnailUrl = `https://videodelivery.net/${videoId}/thumbnails/thumbnail.jpg?time=2s&height=320`;
+    
+    infoDiv.innerHTML = `
+      <div style="width:100%;aspect-ratio:16/9;background-image:url('${thumbnailUrl}');background-size:contain;background-repeat:no-repeat;background-position:center;background-color:#000;position:relative;">
+        <div style="position:absolute;bottom:0;left:0;right:0;padding:0.75rem 1rem;background:rgba(0,0,0,0.75);color:#fff;display:flex;flex-direction:column;gap:0.25rem;">
+          <div style="display:inline-block;background:#f48120;color:#fff;font-size:0.75rem;font-weight:600;padding:0.25rem 0.5rem;border-radius:4px;width:fit-content;">Stream Video</div>
+          <div style="font-family:monospace;font-size:0.875rem;">ID: ${videoId}</div>
+          <div id="streamSourceStatus" style="font-size:0.875rem;opacity:0.9;">Starting...</div>
+        </div>
+      </div>
+    `;
+    
+    // Update status periodically.
+    const statusEl = document.getElementById("streamSourceStatus");
+    if (statusEl) {
+      setTimeout(() => { statusEl.textContent = "Processing..."; }, 1000);
+    }
+  }
+
+  function hideStreamSourcePanel() {
+    const infoDiv = document.getElementById("streamSourceInfo");
+    if (infoDiv) {
+      infoDiv.style.display = "none";
+    }
+    localVideo.style.display = "block";
   }
 
   function startMediaRecorder(usePreview) {
@@ -433,6 +584,7 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     mediaRecorder = null;
     ws = null;
     cleanupMSE();
+    hideStreamSourcePanel();
     startBtn.disabled = false;
     stopBtn.disabled = true;
   }
@@ -776,6 +928,57 @@ const rtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
   .hint {
     font-size: 0.875rem;
     margin: 0.5rem 0;
+  }
+
+  .stream-source-info {
+    width: 100%;
+    border-radius: 4px;
+    overflow: hidden;
+    background: #000;
+  }
+
+  .stream-source-thumbnail {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background-size: contain;
+    background-repeat: no-repeat;
+    background-position: center;
+    background-color: #000;
+    position: relative;
+  }
+
+  .stream-source-overlay {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    padding: 0.75rem 1rem;
+    background: rgba(0, 0, 0, 0.75);
+    color: white;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .stream-source-badge {
+    display: inline-block;
+    background: #f48120;
+    color: white;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    width: fit-content;
+  }
+
+  .stream-source-id {
+    font-family: monospace;
+    font-size: 0.875rem;
+  }
+
+  .stream-source-status {
+    font-size: 0.875rem;
+    opacity: 0.9;
   }
 
   .hint a {

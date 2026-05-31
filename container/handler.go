@@ -7,11 +7,14 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 
 	"github.com/gorilla/websocket"
 	"media-workers-poc/ffmpeg"
+	"media-workers-poc/hlsdownloader"
 	"media-workers-poc/overlay"
+	"media-workers-poc/subtitle"
 )
 
 // StreamHandler manages a single WebSocket connection and its ffmpeg pipeline.
@@ -29,7 +32,8 @@ func NewStreamHandler(conn *websocket.Conn) *StreamHandler {
 }
 
 // Run blocks until the stream is finished. It spawns ffmpeg and proxies
-// WebSocket messages to ffmpeg's stdin pipe.
+// WebSocket messages to ffmpeg's stdin pipe (webcam source) or lets ffmpeg
+// read an HLS URL directly (stream source).
 func (h *StreamHandler) Run() error {
 	streamURL := os.Getenv("STREAM_URL")
 
@@ -49,11 +53,142 @@ func (h *StreamHandler) Run() error {
 		return fmt.Errorf("STREAM_URL environment variable not set")
 	}
 
+	isStreamSource := cfg.SourceType == "stream"
 	isAnimatedOverlay := cfg.Preset == "animated-overlay"
 	isFilters := cfg.Preset == "filters"
 
-	h.logger.Printf("Config: preset=%q preview=%v animated=%v filters=%v stream=%s",
-		cfg.Preset, cfg.PreviewMode, isAnimatedOverlay, isFilters, streamURL)
+	h.logger.Printf("Config: preset=%q source=%q preview=%v animated=%v filters=%v stream=%s video=%s",
+		cfg.Preset, cfg.SourceType, cfg.PreviewMode, isAnimatedOverlay, isFilters, streamURL, cfg.VideoURL)
+
+	if isStreamSource {
+		return h.runStreamSource(cfg, streamURL)
+	}
+
+	return h.runWebcamSource(cfg, firstChunk, streamURL)
+}
+
+// runStreamSource handles streaming from an HLS URL.  Segments are downloaded
+// by the hlsdownloader package and fed to ffmpeg via a pipe, giving us full
+// control over buffering and pacing.
+func (h *StreamHandler) runStreamSource(cfg ffmpeg.Config, streamURL string) error {
+	// If subtitle burn-in is requested, fetch and convert subtitles before
+	// starting ffmpeg.
+	if cfg.BurnSubtitles {
+		videoID := extractVideoID(cfg.VideoURL)
+		if videoID != "" {
+			h.logger.Printf("Fetching subtitles for video ID: %s", videoID)
+			result, err := subtitle.FetchAndConvert(videoID)
+			if err != nil {
+				h.logger.Printf("Subtitle fetch failed: %v", err)
+			} else if result.Warning != "" {
+				h.logger.Printf("Subtitle warning: %s", result.Warning)
+				// Send warning to browser.
+				h.conn.WriteMessage(websocket.TextMessage, []byte(`{"warning":"`+result.Warning+`"}`))
+			} else {
+				h.logger.Printf("Subtitles ready: lang=%s cues=%d file=%s",
+					result.Language, result.CueCount, result.SubtitleFile)
+				cfg.SubtitleFile = result.SubtitleFile
+				// Send subtitle info to browser.
+				info := fmt.Sprintf(`{"subtitle_lang":"%s","subtitle_cues":%d}`,
+					result.Language, result.CueCount)
+				h.conn.WriteMessage(websocket.TextMessage, []byte(info))
+			}
+		}
+	}
+
+	// Step 1: Create a pipe for ffmpeg video input.
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("failed to create pipe: %w", err)
+	}
+
+	// Step 2: Start HLS segment downloader goroutine.
+	downloaderDone := make(chan error, 1)
+	go func() {
+		h.logger.Printf("Starting HLS downloader for: %s", cfg.VideoURL)
+		err := hlsdownloader.DownloadAndStream(cfg.VideoURL, pw)
+		if err != nil {
+			h.logger.Printf("HLS downloader error: %v", err)
+		}
+		downloaderDone <- err
+	}()
+
+	// Step 3: Build ffmpeg arguments and start ffmpeg.
+	// For stream source we feed MPEG-TS segments through /dev/fd/3.
+	args := ffmpeg.BuildArgs(cfg, "/dev/fd/3", streamURL)
+	h.logger.Printf("Starting ffmpeg (stream source via pipe): %v", args)
+
+	cmd := exec.Command("ffmpeg", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.ExtraFiles = []*os.File{pr}
+	cmd.Stderr = os.Stderr
+
+	var ffmpegOut io.ReadCloser
+	if cfg.PreviewMode {
+		ffmpegOut, err = cmd.StdoutPipe()
+		if err != nil {
+			pr.Close()
+			return fmt.Errorf("failed to create stdout pipe: %w", err)
+		}
+	} else {
+		cmd.Stdout = os.Stdout
+	}
+
+	if err := cmd.Start(); err != nil {
+		pr.Close()
+		return fmt.Errorf("failed to start ffmpeg: %w", err)
+	}
+
+	// Close read end in parent — only ffmpeg reads it.
+	pr.Close()
+
+	// In preview mode, proxy ffmpeg stdout back to the WebSocket.
+	var previewDone chan error
+	if cfg.PreviewMode && ffmpegOut != nil {
+		previewDone = make(chan error, 1)
+		go func() {
+			previewDone <- h.proxyFfmpegOutputToWebSocket(ffmpegOut)
+		}()
+	}
+
+	// Wait for ffmpeg exit or client disconnect.
+	ffmpegDone := make(chan error, 1)
+	go func() {
+		ffmpegDone <- cmd.Wait()
+	}()
+
+	// Also watch for WebSocket close so we can kill ffmpeg when the
+	// browser disconnects.
+	wsClose := make(chan error, 1)
+	go func() {
+		_, _, err := h.conn.ReadMessage()
+		if err != nil {
+			wsClose <- err
+		}
+	}()
+
+	select {
+	case err := <-ffmpegDone:
+		if err != nil {
+			h.logger.Printf("ffmpeg exited with error: %v", err)
+			h.conn.Close()
+			return fmt.Errorf("ffmpeg failed: %w", err)
+		}
+		h.logger.Printf("ffmpeg exited cleanly")
+		return nil
+
+	case <-wsClose:
+		h.logger.Printf("WebSocket closed, killing ffmpeg")
+		cmd.Process.Kill()
+		<-ffmpegDone
+		return nil
+	}
+}
+
+// runWebcamSource handles streaming from the browser webcam via WebSocket
+// binary chunks piped to ffmpeg.
+func (h *StreamHandler) runWebcamSource(cfg ffmpeg.Config, firstChunk []byte, streamURL string) error {
+	isAnimatedOverlay := cfg.Preset == "animated-overlay"
 
 	// Start a persistent goroutine that reads from the WebSocket and feeds
 	// binary chunks into a buffered channel.
@@ -217,7 +352,8 @@ func (h *StreamHandler) Run() error {
 }
 
 // readConfigAndFirstChunk reads messages from the WebSocket until it has
-// both a Config (optional) and the first binary chunk (required).
+// both a Config (optional) and the first binary chunk (required for webcam
+// source). For stream source, no binary chunk is expected.
 func (h *StreamHandler) readConfigAndFirstChunk() (ffmpeg.Config, []byte, error) {
 	var cfg ffmpeg.Config
 	var firstChunk []byte
@@ -232,6 +368,11 @@ func (h *StreamHandler) readConfigAndFirstChunk() (ffmpeg.Config, []byte, error)
 			if err := json.Unmarshal(data, &cfg); err != nil {
 				h.logger.Printf("Invalid config JSON, using defaults: %v", err)
 				cfg = ffmpeg.Config{}
+			}
+			// For stream source, the config is all we need — no binary chunks
+			// will arrive. Return immediately.
+			if cfg.SourceType == "stream" {
+				return cfg, nil, nil
 			}
 			continue
 		}
@@ -319,4 +460,18 @@ func (h *StreamHandler) proxyFfmpegOutputToWebSocket(r io.ReadCloser) error {
 		}
 	}
 	return nil
+}
+
+// extractVideoID extracts the video ID from a Cloudflare Stream HLS URL.
+// Expected format: https://videodelivery.net/{id}/manifest/video.m3u8
+func extractVideoID(videoURL string) string {
+	const prefix = "https://videodelivery.net/"
+	if !strings.HasPrefix(videoURL, prefix) {
+		return ""
+	}
+	rest := videoURL[len(prefix):]
+	if idx := strings.Index(rest, "/"); idx != -1 {
+		return rest[:idx]
+	}
+	return rest
 }

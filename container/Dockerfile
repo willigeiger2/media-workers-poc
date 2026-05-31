@@ -19,8 +19,10 @@ RUN go mod download
 
 COPY container/main.go container/handler.go ./
 COPY container/ffmpeg/ ./ffmpeg/
+COPY container/hlsdownloader/ ./hlsdownloader/
 COPY container/media/ ./media/
 COPY container/overlay/ ./overlay/
+COPY container/subtitle/ ./subtitle/
 
 RUN go build -trimpath -o /media-poc ./main.go ./handler.go
 

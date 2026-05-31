@@ -17,6 +17,42 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     </p>
 
     <div class="settings-form">
+      <h3>Input Source</h3>
+      
+      <div class="field field-radio-group">
+        <label class="radio-label">
+          <input type="radio" name="sourceType" value="webcam" id="sourceWebcam" checked />
+          <span>Webcam (browser MediaRecorder)</span>
+        </label>
+        <label class="radio-label">
+          <input type="radio" name="sourceType" value="stream" id="sourceStream" />
+          <span>Stream Video (HLS ingest)</span>
+        </label>
+        <p class="hint">
+          Select where the input video comes from. "Stream Video" reads an
+          existing Cloudflare Stream video by its HLS manifest instead of
+          capturing your webcam.
+        </p>
+      </div>
+
+      <div class="field" id="streamVideoField" style="display: none;">
+        <label for="videoId">Stream Video ID</label>
+        <input
+          type="text"
+          id="videoId"
+          placeholder="cf1e..."
+        />
+        <p class="hint">
+          The Cloudflare Stream video ID (the hex string from the video URL).
+          Example: if your video is at <code>https://watch.cloudflarestream.com/cf1eabcd...</code>,
+          enter <code>cf1eabcd...</code>.
+        </p>
+      </div>
+
+      <hr class="divider" />
+
+      <h3>Output</h3>
+
       <div class="field">
         <label for="streamUrl">Stream Ingest URL (RTMP)</label>
         <input
@@ -95,6 +131,10 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
   const playbackUrlInput = document.getElementById("playbackUrl");
   const rtmpPlaybackUrlInput = document.getElementById("rtmpPlaybackUrl");
   const previewModeInput = document.getElementById("previewMode");
+  const sourceWebcamInput = document.getElementById("sourceWebcam");
+  const sourceStreamInput = document.getElementById("sourceStream");
+  const videoIdInput = document.getElementById("videoId");
+  const streamVideoField = document.getElementById("streamVideoField");
   const saveBtn = document.getElementById("saveBtn");
   const resetBtn = document.getElementById("resetBtn");
   const status = document.getElementById("status");
@@ -104,8 +144,18 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     streamUrl: defaultStreamUrl,
     playbackUrl: defaultPlaybackUrl,
     rtmpPlaybackUrl: defaultRtmpPlaybackUrl,
-    previewMode: false
+    previewMode: false,
+    sourceType: "webcam",
+    videoId: ""
   };
+
+  function updateSourceVisibility() {
+    if (sourceStreamInput.checked) {
+      streamVideoField.style.display = "";
+    } else {
+      streamVideoField.style.display = "none";
+    }
+  }
 
   function loadSettings() {
     try {
@@ -116,12 +166,24 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
         playbackUrlInput.value = parsed.playbackUrl || defaults.playbackUrl;
         rtmpPlaybackUrlInput.value = parsed.rtmpPlaybackUrl || defaults.rtmpPlaybackUrl;
         previewModeInput.checked = parsed.previewMode ?? defaults.previewMode;
+        
+        const sourceType = parsed.sourceType || defaults.sourceType;
+        if (sourceType === "stream") {
+          sourceStreamInput.checked = true;
+        } else {
+          sourceWebcamInput.checked = true;
+        }
+        videoIdInput.value = parsed.videoId || defaults.videoId;
+        updateSourceVisibility();
       } else {
         // No saved settings — populate with defaults from .env
         streamUrlInput.value = defaults.streamUrl;
         playbackUrlInput.value = defaults.playbackUrl;
         rtmpPlaybackUrlInput.value = defaults.rtmpPlaybackUrl;
         previewModeInput.checked = defaults.previewMode;
+        sourceWebcamInput.checked = true;
+        videoIdInput.value = defaults.videoId;
+        updateSourceVisibility();
       }
     } catch (e) {
       console.error("Failed to load settings:", e);
@@ -130,6 +192,9 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
       playbackUrlInput.value = defaults.playbackUrl;
       rtmpPlaybackUrlInput.value = defaults.rtmpPlaybackUrl;
       previewModeInput.checked = defaults.previewMode;
+      sourceWebcamInput.checked = true;
+      videoIdInput.value = defaults.videoId;
+      updateSourceVisibility();
     }
   }
 
@@ -138,7 +203,9 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
       streamUrl: streamUrlInput.value.trim(),
       playbackUrl: playbackUrlInput.value.trim(),
       rtmpPlaybackUrl: rtmpPlaybackUrlInput.value.trim(),
-      previewMode: previewModeInput.checked
+      previewMode: previewModeInput.checked,
+      sourceType: sourceStreamInput.checked ? "stream" : "webcam",
+      videoId: videoIdInput.value.trim()
     };
 
     localStorage.setItem("mediaWorkersSettings", JSON.stringify(settings));
@@ -150,6 +217,9 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     playbackUrlInput.value = defaults.playbackUrl;
     rtmpPlaybackUrlInput.value = defaults.rtmpPlaybackUrl;
     previewModeInput.checked = defaults.previewMode;
+    sourceWebcamInput.checked = true;
+    videoIdInput.value = defaults.videoId;
+    updateSourceVisibility();
     
     localStorage.removeItem("mediaWorkersSettings");
     showStatus("Settings reset to defaults.", "info");
@@ -168,6 +238,8 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
   // Load saved settings on page load
   loadSettings();
 
+  sourceWebcamInput.addEventListener("change", updateSourceVisibility);
+  sourceStreamInput.addEventListener("change", updateSourceVisibility);
   saveBtn.addEventListener("click", saveSettings);
   resetBtn.addEventListener("click", resetSettings);
 </script>
@@ -256,6 +328,38 @@ const defaultRtmpPlaybackUrl = import.meta.env.RTMP_PLAYBACK_URL || "";
     margin: 0.5rem 0 0 0;
     font-size: 0.875rem;
     color: #666;
+  }
+
+  .settings-form h3 {
+    margin-top: 0;
+    margin-bottom: 1rem;
+    font-size: 1.125rem;
+  }
+
+  .divider {
+    border: none;
+    border-top: 1px solid #ddd;
+    margin: 1.5rem 0;
+  }
+
+  .field-radio-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .radio-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    cursor: pointer;
+    font-weight: 500;
+  }
+
+  .radio-label input[type="radio"] {
+    width: 1.125rem;
+    height: 1.125rem;
+    accent-color: #f48120;
   }
 
   .actions {

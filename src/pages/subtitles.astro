@@ -1,0 +1,246 @@
+---
+import Layout from "../layouts/Layout.astro";
+import StreamingInterface from "../components/StreamingInterface.astro";
+
+const howItWorksSteps = [
+  "Enter a <strong>Stream Video ID</strong> (or use the one from Settings)",
+  "The container fetches the HLS manifest and subtitle track (WebVTT)",
+  "WebVTT is converted to SRT format for ffmpeg compatibility",
+  "ffmpeg reads the video and burns the subtitles into each frame",
+  "Output goes to Cloudflare Stream or back to the browser preview"
+];
+---
+
+<Layout title="Media Workers PoC — Subtitle Burn-in">
+  <StreamingInterface
+    title="Subtitle Burn-in"
+    description="Process a Cloudflare Stream video and burn its subtitles directly into the video frames. The container fetches the WebVTT subtitle track, converts it to SRT, and overlays the text using ffmpeg's subtitles filter."
+    preset="passthrough"
+    howItWorksSteps={howItWorksSteps}
+  >
+    <div class="subtitles-panel" id="subtitlesPanel">
+      <h3>Subtitle Controls</h3>
+      
+      <div class="field">
+        <label for="subtitleVideoId">Stream Video ID</label>
+        <input 
+          type="text" 
+          id="subtitleVideoId" 
+          placeholder="cf1e..."
+        />
+        <p class="hint">
+          Defaults to the Video ID from Settings. Enter a different ID to test
+          another video.
+        </p>
+      </div>
+
+      <div class="subtitle-status" id="subtitleStatus">
+        <p class="status-text">Click <strong>Start Streaming</strong> to begin processing.</p>
+      </div>
+
+      <div class="subtitle-preview" id="subtitlePreview" style="display: none;">
+        <img id="subtitleThumbnail" src="" alt="Video thumbnail" />
+        <div class="subtitle-overlay">
+          <div class="subtitle-badge">Subtitles</div>
+          <div class="subtitle-lang" id="subtitleLang">Language: —</div>
+          <div class="subtitle-cues" id="subtitleCues">Cues: —</div>
+        </div>
+      </div>
+    </div>
+  </StreamingInterface>
+</Layout>
+
+<script>
+  const videoIdInput = document.getElementById("subtitleVideoId");
+  const subtitleStatus = document.getElementById("subtitleStatus");
+  const subtitlePreview = document.getElementById("subtitlePreview");
+  const subtitleThumbnail = document.getElementById("subtitleThumbnail");
+  const subtitleLang = document.getElementById("subtitleLang");
+  const subtitleCues = document.getElementById("subtitleCues");
+
+  function getSettings() {
+    try {
+      return JSON.parse(localStorage.getItem("mediaWorkersSettings") || "{}");
+    } catch {
+      return {};
+    }
+  }
+
+  function loadDefaultVideoId() {
+    const settings = getSettings();
+    if (settings.videoId && !videoIdInput.value) {
+      videoIdInput.value = settings.videoId;
+    }
+  }
+
+  function updateSubtitleStatus(message, type = "info") {
+    subtitleStatus.innerHTML = `<p class="status-text status-${type}">${message}</p>`;
+    subtitleStatus.style.display = "block";
+  }
+
+  function showSubtitlePreview(videoId) {
+    const thumbnailUrl = `https://videodelivery.net/${videoId}/thumbnails/thumbnail.jpg?time=2s&height=320`;
+    subtitleThumbnail.src = thumbnailUrl;
+    subtitlePreview.style.display = "block";
+  }
+
+  function hideSubtitlePreview() {
+    subtitlePreview.style.display = "none";
+  }
+
+  // Override the startStreaming for this page to include subtitle config.
+  const originalStartStreaming = window.startStreaming;
+  
+  window.startStreaming = async function() {
+    const videoId = videoIdInput.value.trim();
+    if (!videoId) {
+      updateSubtitleStatus("Please enter a Stream Video ID.", "error");
+      return;
+    }
+
+    const settings = getSettings();
+    if (settings.sourceType !== "stream") {
+      updateSubtitleStatus(
+        'Subtitle burn-in requires Stream Video source. <a href="/settings">Go to Settings</a> and select "Stream Video" as the input source.',
+        "error"
+      );
+      return;
+    }
+
+    updateSubtitleStatus("Fetching subtitles and starting stream...", "info");
+    showSubtitlePreview(videoId);
+
+    // Call the original startStreaming which will pick up the video ID from settings.
+    // We temporarily override the video ID in settings.
+    const originalVideoId = settings.videoId;
+    settings.videoId = videoId;
+    localStorage.setItem("mediaWorkersSettings", JSON.stringify(settings));
+
+    try {
+      await originalStartStreaming.call(this);
+      updateSubtitleStatus("Streaming with subtitle burn-in...", "success");
+    } catch (err) {
+      updateSubtitleStatus(`Error: ${err.message}`, "error");
+    } finally {
+      // Restore original video ID.
+      settings.videoId = originalVideoId;
+      localStorage.setItem("mediaWorkersSettings", JSON.stringify(settings));
+    }
+  };
+
+  // Load default on page load.
+  loadDefaultVideoId();
+</script>
+
+<style>
+  .subtitles-panel {
+    max-width: 1200px;
+    margin: 0 auto 2rem auto;
+    padding: 1.5rem;
+    background: #f5f5f5;
+    border-radius: 8px;
+  }
+
+  .subtitles-panel h3 {
+    margin-top: 0;
+    margin-bottom: 1rem;
+  }
+
+  .field {
+    margin-bottom: 1rem;
+  }
+
+  .field label {
+    display: block;
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+    color: #333;
+  }
+
+  .field input[type="text"] {
+    width: 100%;
+    padding: 0.75rem;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 1rem;
+    font-family: monospace;
+    box-sizing: border-box;
+  }
+
+  .field input[type="text"]:focus {
+    outline: none;
+    border-color: #f48120;
+  }
+
+  .hint {
+    margin: 0.5rem 0 0 0;
+    font-size: 0.875rem;
+    color: #666;
+  }
+
+  .subtitle-status {
+    margin-top: 1rem;
+    padding: 0.75rem;
+    border-radius: 4px;
+    background: #e3f2fd;
+  }
+
+  .status-text {
+    margin: 0;
+    font-size: 0.875rem;
+  }
+
+  .status-error {
+    color: #c62828;
+  }
+
+  .status-success {
+    color: #2e7d32;
+  }
+
+  .subtitle-preview {
+    margin-top: 1rem;
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    border-radius: 4px;
+    overflow: hidden;
+    background: #000;
+  }
+
+  .subtitle-preview img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .subtitle-overlay {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    padding: 1rem;
+    background: linear-gradient(transparent, rgba(0, 0, 0, 0.8));
+    color: white;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .subtitle-badge {
+    display: inline-block;
+    background: #f48120;
+    color: white;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    width: fit-content;
+  }
+
+  .subtitle-lang,
+  .subtitle-cues {
+    font-size: 0.875rem;
+    opacity: 0.9;
+  }
+</style>

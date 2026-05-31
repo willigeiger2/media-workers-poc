@@ -29,6 +29,21 @@ type Config struct {
 	// STREAM_URL environment variable.
 	StreamURL string `json:"stream_url"`
 
+	// SourceType selects the input source. "webcam" (default) reads binary
+	// chunks from the WebSocket. "stream" reads an HLS manifest directly.
+	SourceType string `json:"source_type"`
+
+	// VideoURL is the HLS manifest URL when SourceType is "stream".
+	VideoURL string `json:"video_url"`
+
+	// BurnSubtitles enables subtitle burn-in when SourceType is "stream".
+	// ffmpeg reads the subtitle file and overlays text onto video frames.
+	BurnSubtitles bool `json:"burn_subtitles"`
+
+	// SubtitleFile is the path to the SRT subtitle file on disk. When empty
+	// and BurnSubtitles is true, the container will fetch and convert VTT.
+	SubtitleFile string `json:"subtitle_file"`
+
 	// OverlayImage is the path to a static image (e.g. PNG with alpha) used
 	// by the "overlay" preset.
 	OverlayImage string `json:"overlay_image"`
@@ -79,44 +94,74 @@ func BuildArgs(cfg Config, videoInput string, output string) []string {
 		return cfg.FFmpegArgs
 	}
 
+	// Determine input source. videoInput is either the HLS URL (for direct
+	// ffmpeg HLS input) or a pipe path (/dev/fd/3 for segment downloader).
+	input := videoInput
+	isStream := cfg.SourceType == "stream"
+
 	switch cfg.Preset {
 	case "animated-overlay":
+		// Animated overlay always uses pipe for webcam; stream source
+		// unsupported for this preset (would need redesign).
+		if isStream {
+			return BuildPassthroughArgs(cfg, input, output)
+		}
 		return BuildAnimatedOverlayArgs(cfg, "/dev/fd/3", output)
 	case "filters":
-		return BuildFilterArgs(cfg, videoInput, output)
+		return BuildFilterArgs(cfg, input, output)
 	case "overlay":
-		return BuildOverlayArgs(cfg, videoInput, output)
+		return BuildOverlayArgs(cfg, input, output)
 	case "passthrough":
 		fallthrough
 	default:
-		return BuildPassthroughArgs(cfg, videoInput, output)
+		return BuildPassthroughArgs(cfg, input, output)
 	}
 }
 
 // BuildPassthroughArgs constructs ffmpeg arguments for WebSocket pass-through.
 //
-// Input is a WebM stream (from MediaRecorder) read from a pipe.
+// Input is a WebM stream (from MediaRecorder) read from a pipe, or an HLS
+// manifest URL when source_type is "stream".
 // Output is H.264/AAC muxed to FLV for RTMP, or fragmented MP4 to stdout
 // when preview mode is enabled.
-//
-// videoInput should be the pipe path, e.g. "/dev/fd/3".
 func BuildPassthroughArgs(cfg Config, videoInput string, output string) []string {
+	isStream := cfg.SourceType == "stream"
+
 	args := []string{
 		"-y", // Overwrite output without asking.
+	}
 
-		// Video input from pipe.
-		"-f", "webm",
-		"-i", videoInput,
+	if isStream {
+		// Stream source: segments fed through a pipe from the Go
+		// hlsdownloader.  The downloader paces writes at real-time speed,
+		// so we do NOT use -re here (it is unreliable with pipe input).
+		// Use -copyts to preserve original presentation timestamps.
+		args = append(args,
+			"-copyts",
+			"-i", videoInput,
+		)
+	} else {
+		// Webcam source: raw WebM chunks from browser MediaRecorder.
+		args = append(args, "-f", "webm", "-i", videoInput)
+	}
 
+	// Apply subtitle burn-in if requested and file exists.
+	filterComplex := buildSubtitleFilter(cfg, "")
+	if filterComplex != "" {
+		args = append(args, "-filter_complex", filterComplex)
+	}
+
+	args = append(args,
 		// Video: transcode to H.264 for RTMP/FLV compatibility.
 		"-c:v", "libx264",
 		"-preset", "fast",
+		"-b:v", defaultTranscodeBitrate,
 		"-g", defaultTranscodeGOP,
 		"-pix_fmt", "yuv420p", // Ensure compatibility.
 
 		// No audio for Stage 1.
 		"-an",
-	}
+	)
 
 	if cfg.PreviewMode {
 		args = append(args,
@@ -127,13 +172,27 @@ func BuildPassthroughArgs(cfg Config, videoInput string, output string) []string
 		)
 	} else {
 		args = append(args,
-			"-b:v", defaultTranscodeBitrate,
 			"-f", "flv",
 			output,
 		)
 	}
 
 	return args
+}
+
+// buildSubtitleFilter returns a subtitle filter string if burn-in is enabled
+// and a subtitle file is available. If baseFilter is non-empty, the subtitle
+// filter is appended to it with a comma separator.
+func buildSubtitleFilter(cfg Config, baseFilter string) string {
+	if !cfg.BurnSubtitles || cfg.SubtitleFile == "" {
+		return baseFilter
+	}
+
+	subFilter := fmt.Sprintf("subtitles=%s", cfg.SubtitleFile)
+	if baseFilter != "" {
+		return baseFilter + "," + subFilter
+	}
+	return subFilter
 }
 
 // BuildOverlayArgs constructs ffmpeg arguments that composite a static image
@@ -173,30 +232,45 @@ func BuildOverlayArgs(cfg Config, videoInput string, output string) []string {
 		yExpr = "10"
 	}
 
+	isStream := cfg.SourceType == "stream"
+
 	filterComplex := "[1:v]format=rgba,scale=600:-1[logo];[0:v][logo]overlay=" + xExpr + ":" + yExpr + ":format=auto,format=yuv420p"
+	filterComplex = buildSubtitleFilter(cfg, filterComplex)
 
 	args := []string{
 		"-y",
+	}
 
+	if isStream {
+		// Input 0: stream video (from hlsdownloader pipe).
+		args = append(args,
+			"-copyts",
+			"-i", videoInput,
+		)
+	} else {
 		// Input 0: live video from browser (WebM/VP8).
-		"-f", "webm",
-		"-i", videoInput,
+		args = append(args, "-f", "webm", "-i", videoInput)
+	}
 
+	args = append(args,
 		// Input 1: overlay image.
 		"-i", overlayImage,
 
 		// Composite overlay on top of video.
 		"-filter_complex", filterComplex,
+	)
 
+	args = append(args,
 		// Video: transcode to H.264 for RTMP/FLV compatibility.
 		"-c:v", "libx264",
 		"-preset", "fast",
+		"-b:v", defaultTranscodeBitrate,
 		"-g", defaultTranscodeGOP,
 		"-pix_fmt", "yuv420p",
 
 		// No audio.
 		"-an",
-	}
+	)
 
 	if cfg.PreviewMode {
 		args = append(args,
@@ -207,7 +281,6 @@ func BuildOverlayArgs(cfg Config, videoInput string, output string) []string {
 		)
 	} else {
 		args = append(args,
-			"-b:v", defaultTranscodeBitrate,
 			"-f", "flv",
 			output,
 		)
@@ -276,9 +349,10 @@ func BuildAnimatedOverlayArgs(cfg Config, videoInput string, output string) []st
 
 // BuildFilterArgs constructs ffmpeg arguments with a dynamic filter chain.
 // Supported filters: blur, brightness, contrast, saturation, gamma, sharpen,
-// flip, rotate.
+// flip, rotate. Also supports subtitle burn-in for stream sources.
 func BuildFilterArgs(cfg Config, videoInput string, output string) []string {
 	f := cfg.Filters
+	isStream := cfg.SourceType == "stream"
 
 	// Build the filter_complex chain.
 	var filters []string
@@ -330,6 +404,7 @@ func BuildFilterArgs(cfg Config, videoInput string, output string) []string {
 	filters = append(filters, "format=yuv420p")
 
 	filterComplex := strings.Join(filters, ",")
+	filterComplex = buildSubtitleFilter(cfg, filterComplex)
 
 	// Base video encoding args.
 	videoArgs := []string{
@@ -344,6 +419,7 @@ func BuildFilterArgs(cfg Config, videoInput string, output string) []string {
 	// Output format depends on preview mode.
 	if cfg.PreviewMode {
 		videoArgs = append(videoArgs,
+			"-crf", "20",
 			"-f", "mp4",
 			"-movflags", "frag_keyframe+empty_moov+default_base_moof",
 			"pipe:1",
@@ -355,10 +431,31 @@ func BuildFilterArgs(cfg Config, videoInput string, output string) []string {
 		)
 	}
 
-	return append([]string{
-		"-y",
-		"-f", "webm",
-		"-i", videoInput,
-		"-filter_complex", filterComplex,
-	}, videoArgs...)
+	args := []string{"-y"}
+
+	if isStream {
+		// Input 0: stream video (from hlsdownloader pipe).
+		args = append(args,
+			"-copyts",
+			"-i", videoInput,
+		)
+	} else {
+		args = append(args, "-f", "webm", "-i", videoInput)
+	}
+
+	args = append(args, "-filter_complex", filterComplex)
+
+	// Base video encoding args.
+	args = append(args,
+		"-c:v", "libx264",
+		"-preset", "fast",
+		"-b:v", defaultTranscodeBitrate,
+		"-g", defaultTranscodeGOP,
+		"-pix_fmt", "yuv420p",
+		"-an",
+	)
+
+	args = append(args, videoArgs...)
+
+	return args
 }
